@@ -11,11 +11,7 @@ A machine learning system that predicts Bitcoin price direction (UP / DOWN / FLA
 ```
 ┌─────────────────────────────────────────────────────┐
 │                    Data Pipeline                    │
-<<<<<<< HEAD
 │  Binance API — SQLite — 18 Technical Features       │
-=======
-│  Binance API → SQLite → 18 Technical Features       │
->>>>>>> fdebdccedea6328b2ff8f29cd8b99c928ca94dcc
 └──────────────────────┬──────────────────────────────┘
                        │
           ┌────────────┴────────────┐
@@ -25,11 +21,7 @@ A machine learning system that predicts Bitcoin price direction (UP / DOWN / FLA
   │  Attention     │       │  VQC  (Q# / MS  │
   │  LSTM          │       │  Quantum SDK)   │
   │                │       │                 │
-<<<<<<< HEAD
   │  F1 ≈ 0.42     │       │  F1 ≈ 0.35      │
-=======
-  │  F1 ≈ 0.344    │       │  F1 ≈ 0.298     │
->>>>>>> fdebdccedea6328b2ff8f29cd8b99c928ca94dcc
   └───────┬────────┘       └────────┬────────┘
           │                         │
           └────────────┬────────────┘
