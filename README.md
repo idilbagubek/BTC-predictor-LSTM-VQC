@@ -10,25 +10,25 @@ A machine learning system that predicts Bitcoin price direction (UP / DOWN / FLA
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                    Data Pipeline                     │
-│  Binance API → SQLite → 18 Technical Features       │
+│                    Data Pipeline                    │
+│  Binance API — SQLite — 18 Technical Features       │
 └──────────────────────┬──────────────────────────────┘
                        │
           ┌────────────┴────────────┐
           │                         │
   ┌───────▼────────┐       ┌────────▼────────┐
-  │  Classical     │       │  Hybrid Quantum  │
+  │  Classical     │       │  Hybrid Quantum │
   │  Attention     │       │  VQC  (Q# / MS  │
-  │  LSTM          │       │  Quantum SDK)    │
-  │                │       │                  │
-  │  F1 ≈ 0.344   │       │  F1 ≈ 0.298     │
+  │  LSTM          │       │  Quantum SDK)   │
+  │                │       │                 │
+  │  F1 ≈ 0.42     │       │  F1 ≈ 0.35      │
   └───────┬────────┘       └────────┬────────┘
           │                         │
           └────────────┬────────────┘
                        │
               ┌────────▼────────┐
               │   Backtester    │
-              │  + Break-even   │
+              │  +              │
               │    Analysis     │
               └─────────────────┘
 ```
@@ -109,79 +109,9 @@ Softmax  → [P(DOWN), P(FLAT), P(UP)]
 
 ---
 
-## Feature Engineering
-
-18 features selected after correlation analysis (dropped 4 pairs with corr > 0.9):
-
-| Round | Features | Cluster |
-|-------|----------|---------|
-| 1 | rsi, bb_pctb, ema_gap_fast, macd, macd_hist, slope | RSI/EMA + MACD/trend |
-| 2 | momentum, realized_vol, bb_width, vol_regime, log_return_1, high_low_range | Volatility + return |
-| 3 | log_volume, volume_zscore, hour_sin, hour_cos, dow_sin, dow_cos | Volume + time cycles |
-
-Dropped (corr > 0.9): `close_open` (=`log_return_1`), `macd_signal`, `atr_norm`, `ema_gap_slow`
-
----
-
-## Results
-
-| Model | Macro-F1 | Random Baseline |
-|-------|----------|----------------|
-| Attention LSTM | 0.344 | 0.333 |
-| Quantum VQC | 0.298 | 0.333 |
-
-**Break-even analysis** (0.1% fee per side):
-
-| Avg 4h BTC move | Win rate needed to profit |
-|-----------------|--------------------------|
-| 0.3% | 83% |
-| 0.5% | 70% |
-| 1.0% | 60% |
-| 2.0% | 55% |
-
-The models' win rates (24–28%) reflect the difficulty of financial prediction, not a bug. In flat/choppy markets, no directional model consistently overcomes transaction costs — this is the honest result.
-
----
-
-## Project Structure
-
-```
-.
-├── main.py                  # CLI entry point
-├── config.py                # All hyperparameters
-├── data_collector.py        # Binance API + SQLite
-├── feature_engineer.py      # 18 technical features + adaptive labeling
-├── model.py                 # Attention LSTM + Focal Loss
-├── trainer.py               # LSTM trainer + QuantumTrainer (SPSA, Adam)
-├── quantum_bridge.py        # Python↔Q# bridge + numpy simulator
-├── backtest.py              # Trading simulation + break-even analysis
-├── live_predictor.py        # Real-time inference
-├── src/
-│   └── QuantumClassifier.qs # Q# circuit (correlation-aware CNOTs)
-├── BtcQuantum.csproj        # .NET project file for Q#
-├── requirements.txt
-└── models/                  # Saved after training (git-ignored)
-    ├── lstm_model.pt
-    ├── quantum_params.pkl
-    ├── scaler.pkl
-    └── calibration.pkl
-```
-
----
-
-## Setup
-
 ### Prerequisites
 - Python 3.9+
-- [.NET SDK 8+](https://dotnet.microsoft.com/download) (for Q# — optional, falls back to numpy simulator)
-
-### Install
-
-```bash
-git clone https://github.com/<your-username>/btc-quantum-predictor.git
-cd btc-quantum-predictor
-pip install -r requirements.txt
-```
+- [.NET SDK 8+](https://dotnet.microsoft.com/download) (for Q#)
 
 ### Run
 
@@ -198,8 +128,11 @@ python main.py train --quantum
 # 3. Backtest both models
 python backtest.py --model both
 
-# 4. Live prediction (requires trained LSTM)
-python main.py predict --single
+# 4a. Live prediction (LSTM)
+python main.py predict 
+
+# 4B. Live prediction (VQC)
+python main.py predict --quantum 
 ```
 
 ---
@@ -208,41 +141,11 @@ python main.py predict --single
 
 The quantum circuit is defined in `src/QuantumClassifier.qs` using Microsoft's Quantum Development Kit.
 
-```bash
-# Check Q# availability
-python -c "import qsharp; print(qsharp.__version__)"
-```
-
-If Q# is unavailable, the bridge automatically falls back to an exact **numpy statevector simulator** — identical results, no .NET required. Training always uses numpy (fast); Q# is used for inference when available.
-
 To install Q# support:
 ```bash
 # .NET SDK 8+ required first
 pip install qsharp
 dotnet build BtcQuantum.csproj
-```
-
----
-
-## Configuration
-
-All settings are in `config.py`:
-
-```python
-# Quantum circuit
-quantum_config.n_data_qubits = 6     # data encoding qubits
-quantum_config.spsa_estimates = 5    # gradient estimates per step
-quantum_config.max_epochs = 200
-quantum_config.learning_rate = 0.004
-
-# LSTM
-model_config.hidden_size = 128
-model_config.num_layers = 2
-model_config.use_attention = True
-
-# Cross-validation
-cv_config.n_splits = 3
-cv_config.embargo_min_gap = 48       # candles between train/test (= 4h)
 ```
 
 ---

@@ -1,9 +1,4 @@
 """
-Backtesting & Profitability Analysis
-=====================================
-Simulates a simple long/short strategy driven by model predictions
-on the held-out test period and reports key performance metrics.
-
 Usage:
     python backtest.py --model lstm       # LSTM backtest
     python backtest.py --model quantum    # Quantum VQC backtest
@@ -24,11 +19,10 @@ from config import (
 from data_collector import load_candles_as_dataframe
 from feature_engineer import FeatureEngineer, build_sequences
 
-FEE = 0.001          # 0.1% per side (Binance taker)
+FEE = 0.001        
 INITIAL_CAPITAL = 10_000.0
-TEST_FRACTION = 0.20  # last 20% of labelled data used for backtest
+TEST_FRACTION = 0.20  
 
-# Original 22-feature list the LSTM was trained on (before correlation cleanup)
 LSTM_FEATURES_22 = [
     "log_return_1", "high_low_range", "close_open", "log_volume",
     "rsi", "macd", "macd_signal", "macd_hist",
@@ -40,10 +34,6 @@ LSTM_FEATURES_22 = [
 # Helpers
 
 def load_data(feat_cols=None):
-    """
-    Load candles, compute features, labels, and build sequences.
-    feat_cols: override which features to use (default: feature_config.feature_names)
-    """
     if feat_cols is None:
         feat_cols = feature_config.feature_names
 
@@ -52,7 +42,6 @@ def load_data(feat_cols=None):
     df_feat = fe.compute_features(df)
     labels = fe.compute_labels(df_feat, use_adaptive=label_config.use_adaptive_epsilon)
 
-    # Temporarily override feature list for build_sequences
     original = feature_config.feature_names[:]
     feature_config.feature_names[:] = feat_cols
     X, y, timestamps = build_sequences(df_feat, labels, include_current_candle=True)
@@ -71,10 +60,7 @@ def load_data(feat_cols=None):
 
 
 def get_future_return(df_valid: pd.DataFrame, idx: int) -> float:
-    """
-    Approximate 4-hour return starting from sequence endpoint at idx.
-    horizon_candles = 48 five-minute candles = 4 hours.
-    """
+   
     horizon = label_config.horizon_candles
     if idx + horizon >= len(df_valid):
         return 0.0
@@ -83,12 +69,9 @@ def get_future_return(df_valid: pd.DataFrame, idx: int) -> float:
     return (exit_ - entry) / entry
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LSTM predictor
-# ─────────────────────────────────────────────────────────────────────────────
+# LSTM 
 
 def predict_lstm(X_test: np.ndarray, fe: FeatureEngineer, feat_cols: list):
-    """Return (probs array, preds array) for the test sequences."""
     import torch
     from model import AttentionLSTMClassifier, LSTMClassifier
 
@@ -96,7 +79,6 @@ def predict_lstm(X_test: np.ndarray, fe: FeatureEngineer, feat_cols: list):
     checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=False)
     cfg = checkpoint.get("config", {})
 
-    # Detect input_size from saved weights
     saved_input_size = checkpoint["model_state_dict"]["lstm.weight_ih_l0"].shape[1]
     orig_input = model_config.input_size
     model_config.input_size = saved_input_size
@@ -112,7 +94,6 @@ def predict_lstm(X_test: np.ndarray, fe: FeatureEngineer, feat_cols: list):
     model.eval()
     model_config.input_size = orig_input  # restore
 
-    # Calibration
     temperature = 1.0
     if os.path.exists(CALIBRATION_PATH):
         with open(CALIBRATION_PATH, "rb") as f:
@@ -141,9 +122,7 @@ def predict_lstm(X_test: np.ndarray, fe: FeatureEngineer, feat_cols: list):
     return probs, preds
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Quantum VQC predictor
-# ─────────────────────────────────────────────────────────────────────────────
+# VQC
 
 def predict_quantum(X_test: np.ndarray):
     """Return (probs array, preds array) using saved VQC params."""
@@ -175,9 +154,7 @@ def predict_quantum(X_test: np.ndarray):
     return probs, preds
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Simulate strategy
-# ─────────────────────────────────────────────────────────────────────────────
+# Simulate 
 
 def simulate(
     preds: np.ndarray,
@@ -187,15 +164,7 @@ def simulate(
     confidence_threshold: float = 0.42,
     long_only: bool = False,
 ) -> dict:
-    """
-    Strategy:
-      UP   → LONG  for next 4 h  (if confidence > threshold)
-      DOWN → SHORT for next 4 h  (if confidence > threshold and not long_only)
-      FLAT or low-confidence → skip (cash)
-
-    confidence_threshold: only trade when max(probs) > this value
-    long_only: if True, skip DOWN predictions (no shorting)
-    """
+   
     capital = INITIAL_CAPITAL
     equity_curve = [capital]
     trade_returns = []
@@ -218,7 +187,7 @@ def simulate(
             net = raw_ret - 2 * FEE
         elif pred == 0 and not long_only:  # DOWN → SHORT
             net = -raw_ret - 2 * FEE
-        else:            # FLAT or suppressed SHORT → hold cash
+        else:           
             equity_curve.append(capital)
             continue
 
@@ -262,10 +231,6 @@ def buy_and_hold(df_valid: pd.DataFrame) -> dict:
     return {"model": "Buy & Hold BTC", "total_return_pct": ret}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Reporting
-# ─────────────────────────────────────────────────────────────────────────────
-
 def break_even_win_rate(avg_abs_return_pct: float, fee_pct: float = 0.2) -> float:
     """Min win rate needed to profit given avg trade size and round-trip fee."""
     r = avg_abs_return_pct / 100
@@ -301,6 +266,7 @@ def print_report(results: list, bah: dict, df_valid: pd.DataFrame):
         vals = "  ".join(f"{r[key]:>14{fmt}}{suffix}" for r in results)
         print(f"  {label:<28} {vals}")
 
+    row("Macro-F1 (all preds)", "macro_f1",           ".4f", "")
     row("Trades taken",         "n_trades",           "d",   "")
     row("Total return",         "total_return_pct",   ".1f", "%")
     row("Win rate",             "win_rate_pct",        ".1f", "%")
@@ -309,18 +275,7 @@ def print_report(results: list, bah: dict, df_valid: pd.DataFrame):
     row("Max drawdown",         "max_drawdown_pct",    ".1f", "%")
     row("Final capital ($)",    "final_capital",       ",.0f", "")
 
-    print()
-    bah_ret = bah.get("total_return_pct", 0)
-    print(f"  {'Buy & Hold BTC':<28} {bah_ret:>14.1f}%")
     print("=" * 66)
-
-    # Break-even analysis
-    print("\n  BREAK-EVEN ANALYSIS")
-    print("  " + "-" * 50)
-    print("  How accurate must a model be to profit (after fees)?")
-    for avg_move in [0.3, 0.5, 1.0, 2.0]:
-        be = break_even_win_rate(avg_move) * 100
-        print(f"    Avg 4h move {avg_move:.1f}% → need {be:.0f}% win rate to break even")
 
     for r in results:
         bd = r["trade_breakdown"]
@@ -335,11 +290,6 @@ def print_report(results: list, bah: dict, df_valid: pd.DataFrame):
             pct = count / total * 100 if total > 0 else 0
             print(f"    {label:<22} {count:5d}  ({pct:.1f}%)")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
-
 def main():
     parser = argparse.ArgumentParser(description="Backtest trading strategy")
     parser.add_argument("--model", choices=["lstm", "quantum", "both"], default="both")
@@ -351,35 +301,35 @@ def main():
     df_valid_ref = None
 
     if args.model in ("lstm", "both"):
-        print("\nLoading data for LSTM (22 features)...")
+        print("\nLoading data for LSTM")
         X_te, y_te, _, df_v, fe = load_data(feat_cols=LSTM_FEATURES_22)
         df_valid_ref = df_v
-        print(f"  Test samples: {len(X_te)}")
+        print(f"Test samples: {len(X_te)}")
         try:
             probs, preds = predict_lstm(X_te, fe, LSTM_FEATURES_22)
             f1 = f1_score(y_te, preds, average="macro", zero_division=0)
-            print(f"  LSTM Macro-F1 on test: {f1:.4f}")
-            results.append(simulate(preds, probs, df_v, "LSTM",
-                                    confidence_threshold=0.50))
+            r = simulate(preds, probs, df_v, "LSTM", confidence_threshold=0.50)
+            r["macro_f1"] = f1
+            results.append(r)
         except Exception as e:
             import traceback; traceback.print_exc()
-            print(f"  LSTM skipped: {e}")
+            print(f"LSTM skipped: {e}")
 
     if args.model in ("quantum", "both"):
-        print("\nLoading data for Quantum VQC (18 features)...")
+        print("\nLoading data for VQC")
         X_te, y_te, _, df_v, _ = load_data(feat_cols=feature_config.feature_names)
         if df_valid_ref is None:
             df_valid_ref = df_v
-        print(f"  Test samples: {len(X_te)}")
+        print(f" Test samples: {len(X_te)}")
         try:
             probs, preds = predict_quantum(X_te)
             f1 = f1_score(y_te, preds, average="macro", zero_division=0)
-            print(f"  VQC  Macro-F1 on test: {f1:.4f}")
-            results.append(simulate(preds, probs, df_v, "Quantum VQC",
-                                    confidence_threshold=0.36))
+            r = simulate(preds, probs, df_v, "Quantum VQC", confidence_threshold=0.36)
+            r["macro_f1"] = f1
+            results.append(r)
         except Exception as e:
             import traceback; traceback.print_exc()
-            print(f"  Quantum skipped: {e}")
+            print(f"Quantum skipped: {e}")
 
     df_valid = df_valid_ref
     bah = buy_and_hold(df_valid)

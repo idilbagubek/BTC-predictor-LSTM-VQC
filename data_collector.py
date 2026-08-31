@@ -1,8 +1,3 @@
-"""
-Data Collection Module
-Fetches BTC candles from Binance and stores in SQLite
-"""
-
 import sqlite3
 import time
 import os
@@ -15,7 +10,6 @@ from config import data_config, DB_PATH
 
 
 def init_database() -> None:
-    """Initialize SQLite database with candles table"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
@@ -34,7 +28,6 @@ def init_database() -> None:
         )
     """)
     
-    # Index for faster queries
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_candles_time 
         ON candles (symbol, interval, open_time DESC)
@@ -53,25 +46,7 @@ def fetch_candles_from_binance(
     limit: int = 1000,
     max_retries: int = 5
 ) -> List[Dict]:
-    """
-    Fetch klines/candles from Binance API with exponential backoff.
     
-    Implements retry logic with exponential backoff to handle:
-    - HTTP 429 (rate limiting)
-    - HTTP 5xx (server errors)
-    - Network timeouts and connection errors
-    
-    Args:
-        symbol: Trading pair (default: BTCUSDT)
-        interval: Candle interval (default: 1m)
-        start_time: Start timestamp in milliseconds
-        end_time: End timestamp in milliseconds
-        limit: Max candles to fetch (max 1000)
-        max_retries: Maximum number of retry attempts
-    
-    Returns:
-        List of candle dictionaries
-    """
     import random
     
     symbol = symbol or data_config.symbol
@@ -95,14 +70,12 @@ def fetch_candles_from_binance(
         try:
             response = requests.get(url, params=params, timeout=30)
             
-            # Handle rate limiting (HTTP 429)
             if response.status_code == 429:
                 wait_time = (2 ** attempt) + random.uniform(0, 1)
                 print(f"Rate limited (429). Waiting {wait_time:.1f}s before retry {attempt+1}/{max_retries}...")
                 time.sleep(wait_time)
                 continue
             
-            # Handle server errors (5xx)
             if response.status_code >= 500:
                 wait_time = (2 ** attempt) + random.uniform(0, 1)
                 print(f"Server error ({response.status_code}). Waiting {wait_time:.1f}s before retry {attempt+1}/{max_retries}...")
@@ -146,21 +119,11 @@ def fetch_candles_from_binance(
             print(f"Request error: {e}. Waiting {wait_time:.1f}s before retry {attempt+1}/{max_retries}...")
             time.sleep(wait_time)
     
-    # All retries exhausted
     print(f"Failed to fetch candles after {max_retries} attempts. Last error: {last_exception}")
     return []
 
 
 def store_candles(candles: List[Dict]) -> int:
-    """
-    Store candles in SQLite database with deduplication
-    
-    Args:
-        candles: List of candle dictionaries
-    
-    Returns:
-        Number of new candles inserted
-    """
     if not candles:
         return 0
     
@@ -263,19 +226,7 @@ def load_candles_as_dataframe(
     end_time: Optional[int] = None,
     limit: Optional[int] = None
 ) -> pd.DataFrame:
-    """
-    Load candles from database as pandas DataFrame
-    
-    Args:
-        symbol: Trading pair
-        interval: Candle interval
-        start_time: Filter candles after this timestamp (ms)
-        end_time: Filter candles before this timestamp (ms)
-        limit: Max number of candles (most recent)
-    
-    Returns:
-        DataFrame with candle data, sorted by time ascending
-    """
+
     symbol = symbol or data_config.symbol
     interval = interval or data_config.interval
     
@@ -298,7 +249,6 @@ def load_candles_as_dataframe(
     query += " ORDER BY open_time ASC"
     
     if limit:
-        # Get last N candles
         query = f"""
             SELECT * FROM (
                 SELECT open_time, open, high, low, close, volume, close_time
@@ -326,32 +276,17 @@ def fetch_historical_data(
     interval: str = None,
     verbose: bool = True
 ) -> int:
-    """
-    Fetch historical candles for training
-    
-    Args:
-        days: Number of days of history to fetch
-        symbol: Trading pair
-        interval: Candle interval
-        verbose: Print progress
-    
-    Returns:
-        Total number of candles fetched
-    """
     symbol = symbol or data_config.symbol
     interval = interval or data_config.interval
     
-    # Calculate timestamps
     end_time = int(datetime.now(timezone.utc).timestamp() * 1000)
     start_time = end_time - (days * 24 * 60 * 60 * 1000)
     
-    # Check what we already have
     oldest = get_oldest_candle_time(symbol, interval)
     latest = get_latest_candle_time(symbol, interval)
     
     total_fetched = 0
-    
-    # Fetch older data if needed
+
     if oldest is None or start_time < oldest:
         if verbose:
             print(f"Fetching historical data from {days} days ago...")
@@ -383,7 +318,7 @@ def fetch_historical_data(
             current_start = candles[-1]["open_time"] + 1
             time.sleep(0.1)  # Rate limiting
     
-    # Fetch recent data to fill gaps (only closed candles)
+    # Fetch recent data to fill gaps 
     if latest:
         if verbose:
             print("Fetching recent data to fill gaps...")
@@ -401,7 +336,6 @@ def fetch_historical_data(
         )
         
         if candles:
-            # Double-check: filter to only closed candles
             candles = filter_closed_candles(candles, interval)
             inserted = store_candles(candles)
             total_fetched += inserted
@@ -432,40 +366,18 @@ def get_interval_ms(interval: str) -> int:
 
 
 def filter_closed_candles(candles: List[Dict], interval: str = None) -> List[Dict]:
-    """
-    Filter out the currently-forming (unclosed) candle.
     
-    A candle is considered closed if its close_time is in the past.
-    This prevents backtest/live mismatch from unstable real-time features.
-    """
     interval = interval or data_config.interval
     interval_ms = get_interval_ms(interval)
     now_ms = int(time.time() * 1000)
     
-    # A candle is closed if close_time < now - small buffer (1 second)
+    # A candle is closed if close_time < now - small buffer 
     cutoff_time = now_ms - 1000
     
     return [c for c in candles if c['close_time'] <= cutoff_time]
 
 
 def update_candles(symbol: str = None, interval: str = None, max_iterations: int = 10) -> int:
-    """
-    Fetch and store the most recent CLOSED candles (for live updates).
-    
-    IMPORTANT: Only stores closed candles to ensure backtest/live parity.
-    The currently-forming candle is filtered out.
-    
-    Implements catch-up loop: if offline longer than fetch limit,
-    will iterate until fully caught up.
-    
-    Args:
-        symbol: Trading pair
-        interval: Candle interval
-        max_iterations: Maximum catch-up iterations to prevent infinite loops
-    
-    Returns:
-        Total number of new candles inserted
-    """
     symbol = symbol or data_config.symbol
     interval = interval or data_config.interval
     interval_ms = get_interval_ms(interval)
@@ -475,12 +387,10 @@ def update_candles(symbol: str = None, interval: str = None, max_iterations: int
     for iteration in range(max_iterations):
         latest = get_latest_candle_time(symbol, interval)
         now_ms = int(time.time() * 1000)
-        
-        # Calculate end_time to exclude the currently-forming candle
+    
         end_time = now_ms - interval_ms
         
         if latest:
-            # Check if we're already caught up
             if latest >= end_time - interval_ms:
                 break
                 
@@ -502,7 +412,6 @@ def update_candles(symbol: str = None, interval: str = None, max_iterations: int
         if not candles:
             break
         
-        # Double-check: filter to only closed candles
         candles = filter_closed_candles(candles, interval)
         
         if not candles:
@@ -511,7 +420,6 @@ def update_candles(symbol: str = None, interval: str = None, max_iterations: int
         inserted = store_candles(candles)
         total_inserted += inserted
         
-        # If we inserted fewer than we fetched, we're caught up
         if inserted == 0 or len(candles) < 1000:
             break
     
@@ -519,11 +427,10 @@ def update_candles(symbol: str = None, interval: str = None, max_iterations: int
 
 
 if __name__ == "__main__":
-    # Test the data collection
     print("Initializing database...")
     init_database()
     
-    print("\nFetching historical data (7 days for quick test)...")
+    print("\nFetching historical data...")
     fetch_historical_data(days=7, verbose=True)
     
     print("\nLoading sample data...")

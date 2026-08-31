@@ -1,8 +1,3 @@
-"""
-LSTM Model for BTC Price Direction Classification
-Enhanced with Attention Mechanisms for Better Temporal Credit Assignment
-"""
-
 import math
 import torch
 import torch.nn as nn
@@ -15,7 +10,6 @@ from config import model_config
 class LSTMClassifier(nn.Module):
     """
     Basic LSTM-based classifier for 3-class price direction prediction.
-    Uses final hidden state with LayerNorm.
     """
     
     def __init__(
@@ -101,14 +95,6 @@ class ScaledBilinearAttention(nn.Module):
         lstm_outputs: torch.Tensor, 
         final_hidden: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            lstm_outputs: [batch, seq_len, hidden]
-            final_hidden: [batch, hidden]
-        Returns:
-            context: [batch, hidden]
-            attn_weights: [batch, seq_len]
-        """
         projected = self.W_a(lstm_outputs)
         scores = torch.bmm(projected, final_hidden.unsqueeze(-1)).squeeze(-1)
         scores = scores / self.scale
@@ -137,14 +123,6 @@ class QKScaledDotAttention(nn.Module):
         lstm_outputs: torch.Tensor, 
         final_hidden: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            lstm_outputs: [batch, seq_len, hidden]
-            final_hidden: [batch, hidden]
-        Returns:
-            context: [batch, hidden]
-            attn_weights: [batch, seq_len]
-        """
         query = self.W_q(final_hidden)
         keys = self.W_k(lstm_outputs)
         scores = torch.bmm(keys, query.unsqueeze(-1)).squeeze(-1)
@@ -163,8 +141,8 @@ class AttentionLSTMClassifier(nn.Module):
     which timesteps in the sequence are most informative for prediction.
     
     Supports two attention variants:
-    - scaled_bilinear: e_t = (h_t^T W_a h_final) / sqrt(H)
-    - qk_scaled_dot: e_t = (W_q h_final)^T (W_k h_t) / sqrt(H)
+    - scaled_bilinear
+    - qk_scaled_dot
     
     Final classifier input is concat(context, h_final) for richer representation.
     """

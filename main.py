@@ -1,14 +1,8 @@
 """
-BTC Price Direction Predictor - Main Entry Point
-=================================================
+BTC Price Direction Predictor 
 
 Enhanced pipeline for predicting BTC price direction over 4-hour horizons
-using Attention LSTM with Focal Loss and Temperature Calibration.
-
-Usage:
-    python main.py collect    # Fetch historical data
-    python main.py train      # Train the LSTM model
-    python main.py predict    # Run live predictions
+using both LSTM and VQC models.
 """
 
 import sys

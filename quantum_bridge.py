@@ -29,9 +29,8 @@ class QuantumVQCBridge:
     n_total       = 7
     n_rounds      = ceil(n_features / n_qubits) = 6
 
-    Each round: Ry-encode chunk of features → CNOT ring
+    Each round: Ry-encode chunk of features + CNOT ring
     Final layer: trainable Ry/Rz on all 7 qubits + CNOT ring
-    Params: 7 × 2 = 14
     """
 
     N_CLASSES    = 3
@@ -53,15 +52,11 @@ class QuantumVQCBridge:
         rng = np.random.default_rng(42)
         self.params = rng.uniform(-0.1, 0.1, size=self.total_params)
 
-        # Extra CNOTs per round for correlated non-adjacent feature pairs.
-        # Populated by set_entanglement_from_correlations(); defaults to ring-only.
         self.extra_cnots: list[list[tuple[int, int]]] = [[] for _ in range(self.n_rounds)]
 
         self._qsharp_available = self._try_import_qsharp()
 
-    # ------------------------------------------------------------------
     # Correlation-aware entanglement
-    # ------------------------------------------------------------------
 
     def set_entanglement_from_correlations(
         self,
@@ -97,9 +92,6 @@ class QuantumVQCBridge:
                 pair_str = ", ".join(f"CNOT(q{c},q{t})" for c, t in pairs)
                 print(f"  Round {r+1}: {pair_str}")
 
-    # ------------------------------------------------------------------
-    # Q# import
-    # ------------------------------------------------------------------
 
     def _try_import_qsharp(self) -> bool:
         try:
@@ -115,13 +107,11 @@ class QuantumVQCBridge:
             print(f"[QuantumBridge] WARNING: Q# init failed ({exc}). Using numpy simulator.")
             return False
 
-    # ------------------------------------------------------------------
-    # Feature preprocessing
-    # ------------------------------------------------------------------
 
     def _scale_features(self, x: np.ndarray) -> np.ndarray:
         """Clip and map features to [-pi, pi] for angle encoding."""
         return np.clip(x, -5.0, 5.0) * (math.pi / 5.0)
+    
 
     def _prepare_input(self, x: np.ndarray) -> np.ndarray:
         if x.ndim == 2:
@@ -129,10 +119,7 @@ class QuantumVQCBridge:
         if len(x) != self.n_features:
             raise ValueError(f"Expected {self.n_features} features, got {len(x)}")
         return self._scale_features(x.astype(float))
-
-    # ------------------------------------------------------------------
-    # Q# execution
-    # ------------------------------------------------------------------
+    
 
     def _run_qsharp(self, features: np.ndarray) -> np.ndarray:
         features_list = [float(v) for v in features]
@@ -146,10 +133,7 @@ class QuantumVQCBridge:
             f"{self.n_shots})"
         )
         return np.array(result, dtype=float)
-
-    # ------------------------------------------------------------------
-    # Numpy statevector simulator (fallback, 7 qubits = 128 states)
-    # ------------------------------------------------------------------
+    
 
     def _run_numpy_simulator(self, features: np.ndarray) -> np.ndarray:
         n = self.n_total   # 7
@@ -212,10 +196,6 @@ class QuantumVQCBridge:
             expectations[cls] = 1.0 - 2.0 * p1
         return expectations
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def forward(self, features: np.ndarray, use_qsharp: bool = False) -> np.ndarray:
         x = self._prepare_input(features)
         if use_qsharp and self._qsharp_available:
@@ -228,17 +208,9 @@ class QuantumVQCBridge:
     def predict(self, features: np.ndarray, use_qsharp: bool = False) -> int:
         return int(np.argmax(self.predict_proba(features, use_qsharp=use_qsharp)))
 
-    # ------------------------------------------------------------------
-    # SPSA gradient (2 circuit runs regardless of param count — fast!)
-    # ------------------------------------------------------------------
-
     def spsa_gradient(self, features: np.ndarray, targets: np.ndarray,
                       epsilon: float = 0.1, n_estimates: int = 3) -> np.ndarray:
-        """
-        SPSA gradient averaged over n_estimates random perturbations.
-        More estimates = less noisy gradient, but n_estimates × 2 forward passes.
-        """
-        # Boost minority classes well above balanced to fight FLAT dominance
+    
         class_weights = np.array([1.8, 0.7, 1.8])
 
         grad = np.zeros_like(self.params)
@@ -261,10 +233,6 @@ class QuantumVQCBridge:
         self.params = saved
         return grad / n_estimates
 
-    # ------------------------------------------------------------------
-    # Save / Load
-    # ------------------------------------------------------------------
-
     def save(self, path: str = QUANTUM_MODEL_PATH) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as f:
@@ -284,11 +252,6 @@ class QuantumVQCBridge:
         bridge.params = d["params"]
         print(f"[QuantumBridge] Loaded from {path}")
         return bridge
-
-
-# ------------------------------------------------------------------
-# Smoke test
-# ------------------------------------------------------------------
 
 if __name__ == "__main__":
     print("=" * 55)

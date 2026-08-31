@@ -1,9 +1,3 @@
-"""
-Feature Engineering Module
-Computes technical indicators and prepares sequences for LSTM
-Enhanced with slope, volatility regime, and adaptive epsilon labeling
-"""
-
 import numpy as np
 import pandas as pd
 from typing import Tuple, Optional, Dict
@@ -13,15 +7,6 @@ from config import feature_config, label_config, SCALER_PATH
 
 
 class FeatureEngineer:
-    """
-    Computes technical indicators and normalizes features for LSTM input.
-    All computations are causal (no look-ahead bias).
-    
-    Enhanced features:
-    - Slope from rolling linear regression
-    - Volatility regime indicator
-    - Adaptive epsilon labeling support
-    """
     
     def __init__(self):
         self.scaler_params = None
@@ -30,51 +15,43 @@ class FeatureEngineer:
         self.vol_quantiles = None
     
     def compute_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Compute all technical indicators from OHLCV data.
-        
-        Args:
-            df: DataFrame with columns [open, high, low, close, volume]
-        
-        Returns:
-            DataFrame with original columns plus computed features
-        """
         df = df.copy()
         
-        required = ['open', 'high', 'low', 'close', 'volume']
-        if not all(col in df.columns for col in required):
-            raise ValueError(f"DataFrame must have columns: {required}")
-        
-        # 1. Log return (1-period)
         df['log_return_1'] = np.log(df['close'] / df['close'].shift(1))
         
-        # 2. High-Low range normalized
         df['high_low_range'] = (df['high'] - df['low']) / df['close']
         
-        # 3. Close-Open change normalized
         df['close_open'] = (df['close'] - df['open']) / df['open']
         
-        # 4. Log volume
         df['log_volume'] = np.log(df['volume'] + 1)
+
+        # rsi
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0.0)
+        loss = -delta.where(delta < 0, 0.0)
+                
+        avg_gain = gain.ewm(alpha=1/feature_config.rsi_period, min_periods=feature_config.rsi_period, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1/feature_config.rsi_period, min_periods=feature_config.rsi_period, adjust=False).mean()
+                
+        rs = avg_gain / (avg_loss + 1e-8)
+        rsi = 100 - (100 / (1 + rs))
+
+        df['rsi'] = rsi / 100.0
+
+        # macd
+        ema_fast = df['close'].ewm(span=feature_config.macd_fast, adjust=False).mean()
+        ema_slow = df['close'].ewm(span=feature_config.macd_slow, adjust=False).mean()
+                
+        macd_line = (ema_fast - ema_slow) / df['close'] 
+        signal_line = macd_line.ewm(span=feature_config.macd_signal, adjust=False).mean()
+        histogram = macd_line - signal_line
+             
+        df['macd'] = macd_line
+        df['macd_signal'] = signal_line
+        df['macd_hist'] = histogram
         
-        # 5. RSI
-        df['rsi'] = self._compute_rsi(df['close'], feature_config.rsi_period)
-        
-        # 6-8. MACD
-        macd, signal, hist = self._compute_macd(
-            df['close'],
-            feature_config.macd_fast,
-            feature_config.macd_slow,
-            feature_config.macd_signal
-        )
-        df['macd'] = macd
-        df['macd_signal'] = signal
-        df['macd_hist'] = hist
-        
-        # 9. ATR (normalized)
         df['atr_norm'] = self._compute_atr(df, feature_config.atr_period) / df['close']
         
-        # 10-11. Bollinger Bands
         bb_width, bb_pctb = self._compute_bollinger(
             df['close'],
             feature_config.bb_period,
@@ -83,26 +60,21 @@ class FeatureEngineer:
         df['bb_width'] = bb_width
         df['bb_pctb'] = bb_pctb
         
-        # 12-13. EMA gaps
         ema_fast = df['close'].ewm(span=feature_config.ema_fast, adjust=False).mean()
         ema_slow = df['close'].ewm(span=feature_config.ema_slow, adjust=False).mean()
         df['ema_gap_fast'] = (df['close'] - ema_fast) / df['close']
         df['ema_gap_slow'] = (df['close'] - ema_slow) / df['close']
         
-        # 14. Momentum
         df['momentum'] = df['close'].pct_change(feature_config.momentum_period)
         
-        # 15. Realized volatility (rolling std of returns)
         df['realized_vol'] = df['log_return_1'].rolling(
             window=feature_config.volatility_period
         ).std()
         
-        # 16. Volume z-score
         vol_mean = df['volume'].rolling(window=feature_config.volume_zscore_period).mean()
         vol_std = df['volume'].rolling(window=feature_config.volume_zscore_period).std()
         df['volume_zscore'] = (df['volume'] - vol_mean) / (vol_std + 1e-8)
         
-        # 17-20. Cyclical Time Embeddings
         if hasattr(df.index, 'hour'):
             hour = df.index.hour
             day_of_week = df.index.dayofweek
@@ -115,47 +87,14 @@ class FeatureEngineer:
         df['dow_sin'] = np.sin(2 * np.pi * day_of_week / 7)
         df['dow_cos'] = np.cos(2 * np.pi * day_of_week / 7)
         
-        # 21. Slope from rolling linear regression on log-price
         df['slope'] = self._compute_slope(df['close'], feature_config.slope_period)
         
-        # 22. Volatility regime indicator
         df['vol_regime'] = self._compute_vol_regime(
             df['realized_vol'], 
             feature_config.vol_regime_quantiles
         )
         
         return df
-    
-    def _compute_rsi(self, prices: pd.Series, period: int) -> pd.Series:
-        """Compute RSI indicator (normalized to 0-1)"""
-        delta = prices.diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = -delta.where(delta < 0, 0.0)
-        
-        avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-        
-        rs = avg_gain / (avg_loss + 1e-8)
-        rsi = 100 - (100 / (1 + rs))
-        
-        return rsi / 100.0
-    
-    def _compute_macd(
-        self, 
-        prices: pd.Series, 
-        fast: int, 
-        slow: int, 
-        signal: int
-    ) -> Tuple[pd.Series, pd.Series, pd.Series]:
-        """Compute MACD indicator (normalized by price)"""
-        ema_fast = prices.ewm(span=fast, adjust=False).mean()
-        ema_slow = prices.ewm(span=slow, adjust=False).mean()
-        
-        macd_line = (ema_fast - ema_slow) / prices
-        signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-        histogram = macd_line - signal_line
-        
-        return macd_line, signal_line, histogram
     
     def _compute_atr(self, df: pd.DataFrame, period: int) -> pd.Series:
         """Compute Average True Range"""
@@ -174,7 +113,6 @@ class FeatureEngineer:
         period: int, 
         num_std: float
     ) -> Tuple[pd.Series, pd.Series]:
-        """Compute Bollinger Band width and %B"""
         sma = prices.rolling(window=period).mean()
         std = prices.rolling(window=period).std()
         
@@ -187,10 +125,6 @@ class FeatureEngineer:
         return width, pctb
     
     def _compute_slope(self, prices: pd.Series, period: int) -> pd.Series:
-        """
-        Compute slope from rolling linear regression on log-price.
-        Positive slope indicates uptrend, negative indicates downtrend.
-        """
         log_prices = np.log(prices)
         
         def rolling_slope(window):
@@ -208,10 +142,6 @@ class FeatureEngineer:
         realized_vol: pd.Series, 
         quantiles: Tuple[float, float]
     ) -> pd.Series:
-        """
-        Compute volatility regime indicator (0=low, 0.5=medium, 1=high).
-        Uses expanding quantiles to avoid look-ahead bias.
-        """
         q_low, q_high = quantiles
         
         def assign_regime(val, q_low_val, q_high_val):
@@ -242,10 +172,6 @@ class FeatureEngineer:
         df: pd.DataFrame, 
         window: int = None
     ) -> pd.Series:
-        """
-        Compute realized volatility for adaptive epsilon labeling.
-        Uses log returns standard deviation.
-        """
         window = window or label_config.vol_window
         log_returns = np.log(df['close'] / df['close'].shift(1))
         return log_returns.rolling(window=window).std()
@@ -257,18 +183,6 @@ class FeatureEngineer:
         use_adaptive: bool = None,
         k: float = None
     ) -> pd.Series:
-        """
-        Compute 3-class labels based on future returns.
-        
-        Args:
-            df: DataFrame with 'close' column
-            horizon: Number of candles to look ahead
-            use_adaptive: If True, use adaptive epsilon based on volatility
-            k: Scaling factor for adaptive epsilon
-        
-        Returns:
-            Series with labels (0=DOWN, 1=FLAT, 2=UP)
-        """
         horizon = horizon or label_config.horizon_candles
         use_adaptive = use_adaptive if use_adaptive is not None else label_config.use_adaptive_epsilon
         k = k if k is not None else self.k_value
@@ -293,7 +207,6 @@ class FeatureEngineer:
         return labels
     
     def tune_epsilon(self, df: pd.DataFrame, percentile: int = None) -> float:
-        """Tune static epsilon based on training data distribution."""
         percentile = percentile or label_config.epsilon_percentile
         horizon = label_config.horizon_candles
         
@@ -312,16 +225,6 @@ class FeatureEngineer:
         df: pd.DataFrame, 
         target_flat_ratio: float = 0.33
     ) -> float:
-        """
-        Tune k parameter for adaptive epsilon to achieve target FLAT class ratio.
-        
-        Args:
-            df: Training DataFrame
-            target_flat_ratio: Target proportion of FLAT labels
-        
-        Returns:
-            Optimal k value
-        """
         k_min, k_max = label_config.k_range
         k_steps = label_config.k_search_steps
         
@@ -346,7 +249,6 @@ class FeatureEngineer:
         return best_k
     
     def fit_scaler(self, df: pd.DataFrame) -> None:
-        """Fit normalization parameters from training data."""
         feature_cols = feature_config.feature_names
         
         missing = [f for f in feature_cols if f not in df.columns]
@@ -363,7 +265,6 @@ class FeatureEngineer:
                 self.scaler_params['std'][col] = 1.0
     
     def transform_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Apply normalization using fitted parameters."""
         if self.scaler_params is None:
             raise ValueError("Scaler not fitted. Call fit_scaler() first.")
         
@@ -378,7 +279,6 @@ class FeatureEngineer:
         return df
     
     def save_scaler(self, path: str = None) -> None:
-        """Save scaler parameters and labeling config to disk."""
         path = path or SCALER_PATH
         with open(path, 'wb') as f:
             pickle.dump({
@@ -390,7 +290,6 @@ class FeatureEngineer:
         print(f"Scaler saved to {path}")
     
     def load_scaler(self, path: str = None) -> None:
-        """Load scaler parameters from disk."""
         path = path or SCALER_PATH
         with open(path, 'rb') as f:
             data = pickle.load(f)
@@ -409,25 +308,6 @@ def build_sequences(
     check_continuity: bool = True,
     include_current_candle: bool = True
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Build sequences for LSTM training.
-    
-    CRITICAL FIX: Window now includes current candle to match live inference.
-    Window indices: [i-window_size+1 : i+1] with label anchored at i.
-    
-    Args:
-        df: DataFrame with normalized features
-        labels: Series with class labels
-        window_size: Sequence length
-        interval_minutes: Expected interval between candles
-        check_continuity: Skip sequences with timestamp gaps
-        include_current_candle: If True, window includes candle at label index
-    
-    Returns:
-        X: Feature sequences [num_samples, window_size, num_features]
-        y: Labels [num_samples]
-        timestamps: Timestamps for each sample
-    """
     window_size = window_size or feature_config.window_size
     feature_cols = feature_config.feature_names
     
@@ -493,7 +373,6 @@ def build_sequences(
 
 
 def get_class_distribution(y: np.ndarray) -> dict:
-    """Get class counts and percentages."""
     unique, counts = np.unique(y, return_counts=True)
     total = len(y)
     

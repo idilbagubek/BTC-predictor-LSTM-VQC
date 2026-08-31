@@ -1,13 +1,3 @@
-"""
-Live Inference Module
-Real-time BTC price direction predictions with terminal output
-
-Enhanced with:
-- Temperature scaling for calibrated probabilities
-- Tuned thresholds from training
-- Feature pipeline matching training exactly
-"""
-
 import os
 import sys
 import time
@@ -32,16 +22,12 @@ from data_collector import (
 
 
 class PredictionHistory:
-    """
-    Tracks prediction history for trend analysis and signal change detection.
-    """
     
     def __init__(self, max_history: int = 20):
         self.max_history = max_history
         self.history: List[Dict] = []
     
     def add(self, result: Dict):
-        """Add a prediction to history"""
         self.history.append({
             'timestamp': result['timestamp'],
             'prediction': result['prediction'],
@@ -55,7 +41,6 @@ class PredictionHistory:
             self.history = self.history[-self.max_history:]
     
     def get_previous(self) -> Optional[Dict]:
-        """Get the previous prediction"""
         if len(self.history) >= 2:
             return self.history[-2]
         return None
@@ -122,14 +107,6 @@ class PredictionHistory:
 
 
 class LivePredictor:
-    """
-    Real-time prediction engine for BTC price direction.
-    
-    Enhanced with:
-    - Temperature scaling for calibrated probabilities
-    - Tuned thresholds loaded from training artifacts
-    - Exact feature pipeline matching training
-    """
     
     def __init__(self, device: str = None, use_quantum: bool = False):
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -248,11 +225,6 @@ class LivePredictor:
         return True
 
     def prepare_features(self, df: pd.DataFrame) -> Optional[np.ndarray]:
-        """
-        Prepare feature sequence from candle data.
-        
-        IMPORTANT: Uses same feature pipeline as training with current candle included.
-        """
         window_size = feature_config.window_size
         
         if len(df) < window_size + 50:
@@ -291,11 +263,7 @@ class LivePredictor:
         return features
     
     def predict(self, features: np.ndarray) -> Dict:
-        """
-        Run inference — quantum VQC or classical LSTM depending on use_quantum.
-        """
         if self.use_quantum:
-            # features is a flat 1-D array (last timestep only)
             flat = features.flatten()
             if self.quantum_mean is not None:
                 flat = (flat - self.quantum_mean) / self.quantum_std

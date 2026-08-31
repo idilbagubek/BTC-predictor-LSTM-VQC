@@ -1,9 +1,3 @@
-"""
-Training Module
-Enhanced with Focal Loss, Rolling CV with Embargo/Purge,
-Adaptive Epsilon, Temperature Calibration, and Threshold Optimization
-"""
-
 import os
 import gc
 import math
@@ -17,18 +11,17 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import (
     f1_score, accuracy_score, balanced_accuracy_score,
-    precision_recall_fscore_support, confusion_matrix, log_loss
+    precision_recall_fscore_support, confusion_matrix
 )
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, List
 import pickle
-from datetime import datetime
 from copy import deepcopy
 import warnings
 warnings.filterwarnings('ignore')
 
 from config import (
     model_config, label_config, feature_config, cv_config, quantum_config,
-    MODEL_PATH, CONFIG_PATH, SCALER_PATH, CALIBRATION_PATH, DATA_DIR
+    MODEL_PATH, SCALER_PATH, CALIBRATION_PATH
 )
 from model import LSTMClassifier, AttentionLSTMClassifier, FocalLoss, count_parameters, create_model
 from feature_engineer import FeatureEngineer, build_sequences, get_class_distribution
@@ -49,165 +42,91 @@ def set_seed(seed: int = 42):
 
 
 class ExpandingWindowCV:
-    """
-    Expanding Window Cross-Validation with strict embargo/purge.
-    
-    Each fold expands the training set while keeping validation/test windows
-    rolling forward. Embargo gap prevents label leakage by excluding samples
-    whose labels overlap with validation period.
-    """
-    
-    def __init__(
-        self,
-        n_splits: int = None,
-        embargo_gap: int = None,
-        val_size: int = None,
-        test_size: int = None
-    ):
+    """Expanding window CV with embargo/purge to prevent label leakage."""
+
+    def __init__(self, n_splits=None, embargo_gap=None, val_size=None, test_size=None):
         self.n_splits = n_splits or cv_config.n_splits
         self.embargo_gap = embargo_gap or cv_config.embargo_min_gap
         self.val_size = val_size or cv_config.validation_min_samples
         self.test_size = test_size
-    
+
     def split(self, X: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """
-        Generate train/val/test indices with embargo gaps.
-        
-        CRITICAL: Excludes training samples where t + horizon >= val_start
-        to prevent label leakage.
-        """
         n_samples = len(X)
-        
         if self.test_size is None:
             self.test_size = max(n_samples // (self.n_splits + 2), self.val_size)
-        
+
+        min_train = cv_config.validation_min_samples
+        min_split = cv_config.validation_min_samples // 2
         splits = []
-        
+
         for i in range(self.n_splits):
-            test_end = n_samples - (self.n_splits - 1 - i) * self.test_size
+            test_end   = n_samples - (self.n_splits - 1 - i) * self.test_size
             test_start = test_end - self.test_size
-            
-            val_end = test_start - self.embargo_gap
-            val_start = val_end - self.val_size
-            
-            train_end = val_start - self.embargo_gap
-            
+            val_end    = test_start - self.embargo_gap
+            val_start  = val_end - self.val_size
+            train_end  = val_start - self.embargo_gap
+
             if train_end < self.test_size:
                 continue
-            
+
             train_idx = np.arange(0, train_end)
-            val_idx = np.arange(val_start, val_end)
-            test_idx = np.arange(test_start, test_end)
-            
-            min_train = cv_config.validation_min_samples
-            min_val = cv_config.validation_min_samples // 2
-            min_test = cv_config.validation_min_samples // 2
-            
-            if len(train_idx) > min_train and len(val_idx) > min_val and len(test_idx) > min_test:
+            val_idx   = np.arange(val_start, val_end)
+            test_idx  = np.arange(test_start, test_end)
+
+            if len(train_idx) > min_train and len(val_idx) > min_split and len(test_idx) > min_split:
                 splits.append((train_idx, val_idx, test_idx))
-        
+
         return splits
 
 
 class TemperatureScaler:
-    """
-    Temperature scaling for probability calibration.
-    Learns a single temperature T that minimizes NLL on validation set.
-    """
-    
     def __init__(self, initial_temp: float = 1.0):
         self.temperature = initial_temp
-    
-    def fit(
-        self, 
-        logits: np.ndarray, 
-        labels: np.ndarray,
-        lr: float = 0.01,
-        max_iter: int = 100
-    ) -> float:
-        """
-        Fit temperature using gradient descent on NLL.
-        """
+
+    def fit(self, logits: np.ndarray, labels: np.ndarray, lr=0.01, max_iter=100) -> float:
         logits_t = torch.tensor(logits, dtype=torch.float32)
         labels_t = torch.tensor(labels, dtype=torch.long)
-        
         temp = nn.Parameter(torch.ones(1))
-        optimizer = optim.LBFGS([temp], lr=lr, max_iter=max_iter)
-        
+        opt = optim.LBFGS([temp], lr=lr, max_iter=max_iter)
+
         def closure():
-            optimizer.zero_grad()
-            scaled_logits = logits_t / temp
-            loss = nn.CrossEntropyLoss()(scaled_logits, labels_t)
-            loss.backward()
-            return loss
-        
-        optimizer.step(closure)
-        
+            opt.zero_grad()
+            nn.CrossEntropyLoss()(logits_t / temp, labels_t).backward()
+            return nn.CrossEntropyLoss()(logits_t / temp, labels_t)
+
+        opt.step(closure)
         self.temperature = max(temp.item(), 0.1)
         return self.temperature
-    
+
     def calibrate(self, logits: np.ndarray) -> np.ndarray:
-        """Apply temperature scaling to get calibrated probabilities."""
-        scaled_logits = logits / self.temperature
-        exp_logits = np.exp(scaled_logits - np.max(scaled_logits, axis=1, keepdims=True))
-        return exp_logits / exp_logits.sum(axis=1, keepdims=True)
+        s = logits / self.temperature
+        e = np.exp(s - np.max(s, axis=1, keepdims=True))
+        return e / e.sum(axis=1, keepdims=True)
 
 
 class ThresholdOptimizer:
-    """
-    Optimize min_confidence and confidence_margin for action decisions.
-    """
-    
     def __init__(self):
         self.best_min_confidence = 0.4
         self.best_confidence_margin = 0.15
         self.best_score = 0.0
-    
-    def optimize(
-        self,
-        probs: np.ndarray,
-        labels: np.ndarray,
-        metric: str = 'macro_f1'
-    ) -> Tuple[float, float]:
-        """
-        Grid search for optimal thresholds.
-        """
-        best_score = 0.0
-        best_params = (0.4, 0.15)
-        
+
+    def optimize(self, probs: np.ndarray, labels: np.ndarray, metric='macro_f1') -> Tuple[float, float]:
+        best_score, best_params = 0.0, (0.4, 0.15)
         for min_conf in np.arange(0.3, 0.6, 0.05):
             for margin in np.arange(0.05, 0.25, 0.05):
                 preds = self._apply_thresholds(probs, min_conf, margin)
-                
-                if metric == 'macro_f1':
-                    score = f1_score(labels, preds, average='macro')
-                else:
-                    score = accuracy_score(labels, preds)
-                
+                score = f1_score(labels, preds, average='macro') if metric == 'macro_f1' else accuracy_score(labels, preds)
                 if score > best_score:
-                    best_score = score
-                    best_params = (min_conf, margin)
-        
+                    best_score, best_params = score, (min_conf, margin)
         self.best_min_confidence, self.best_confidence_margin = best_params
         self.best_score = best_score
-        
         return best_params
-    
-    def _apply_thresholds(
-        self, 
-        probs: np.ndarray, 
-        min_conf: float, 
-        margin: float
-    ) -> np.ndarray:
-        """Apply thresholds to convert probabilities to predictions."""
+
+    def _apply_thresholds(self, probs: np.ndarray, min_conf: float, margin: float) -> np.ndarray:
         preds = np.argmax(probs, axis=1)
-        max_probs = np.max(probs, axis=1)
         sorted_probs = np.sort(probs, axis=1)[:, ::-1]
-        margins = sorted_probs[:, 0] - sorted_probs[:, 1]
-        
-        uncertain = (max_probs < min_conf) | (margins < margin)
+        uncertain = (np.max(probs, axis=1) < min_conf) | (sorted_probs[:, 0] - sorted_probs[:, 1] < margin)
         preds[uncertain] = 1
-        
         return preds
 
 
@@ -503,7 +422,6 @@ class Trainer:
         
         final_val_metrics = self.evaluate(model, val_loader, return_logits=True)
         
-        # Clean up fold-specific files
         gc.collect()
         
         return model, final_val_metrics, fold_history
@@ -852,74 +770,42 @@ class Trainer:
 
 
 class BaselineModels:
-    """Baseline models for comparison."""
-    
     @staticmethod
-    def always_flat(y_true: np.ndarray) -> Dict:
-        y_pred = np.ones_like(y_true)
-        return BaselineModels._compute_metrics(y_true, y_pred, "Always-FLAT")
-    
-    @staticmethod
-    def always_up(y_true: np.ndarray) -> Dict:
-        y_pred = np.full_like(y_true, 2)
-        return BaselineModels._compute_metrics(y_true, y_pred, "Always-UP")
-    
-    @staticmethod
-    def always_down(y_true: np.ndarray) -> Dict:
-        y_pred = np.zeros_like(y_true)
-        return BaselineModels._compute_metrics(y_true, y_pred, "Always-DOWN")
-    
-    @staticmethod
-    def logistic_regression_last_step(
-        X_train: np.ndarray, 
-        y_train: np.ndarray,
-        X_test: np.ndarray,
-        y_test: np.ndarray
-    ) -> Tuple[np.ndarray, Dict]:
-        X_train_last = X_train[:, -1, :]
-        X_test_last = X_test[:, -1, :]
-        
-        model = LogisticRegression(
-            max_iter=1000,
-            class_weight='balanced',
-            solver='lbfgs'
-        )
-        model.fit(X_train_last, y_train)
-        y_pred = model.predict(X_test_last)
-        
-        return y_pred, BaselineModels._compute_metrics(y_test, y_pred, "LogReg-LastStep")
-    
-    @staticmethod
-    def mlp_last_step(
-        X_train: np.ndarray,
-        y_train: np.ndarray,
-        X_test: np.ndarray,
-        y_test: np.ndarray
-    ) -> Tuple[np.ndarray, Dict]:
-        X_train_last = X_train[:, -1, :]
-        X_test_last = X_test[:, -1, :]
-        
-        model = MLPClassifier(
-            hidden_layer_sizes=(64, 32),
-            max_iter=500,
-            early_stopping=True,
-            validation_fraction=0.1,
-            random_state=42
-        )
-        model.fit(X_train_last, y_train)
-        y_pred = model.predict(X_test_last)
-        
-        return y_pred, BaselineModels._compute_metrics(y_test, y_pred, "MLP-LastStep")
-    
-    @staticmethod
-    def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, name: str) -> Dict:
+    def _metrics(y_true, y_pred, name):
         return {
             'name': name,
             'macro_f1': f1_score(y_true, y_pred, average='macro'),
             'balanced_accuracy': balanced_accuracy_score(y_true, y_pred),
             'accuracy': accuracy_score(y_true, y_pred),
-            'confusion_matrix': confusion_matrix(y_true, y_pred)
+            'confusion_matrix': confusion_matrix(y_true, y_pred),
         }
+
+    @staticmethod
+    def _compute_metrics(y_true, y_pred, name): return BaselineModels._metrics(y_true, y_pred, name)
+
+    @staticmethod
+    def always_flat(y):  return BaselineModels._metrics(y, np.ones_like(y),       "Always-FLAT")
+    @staticmethod
+    def always_up(y):    return BaselineModels._metrics(y, np.full_like(y, 2),    "Always-UP")
+    @staticmethod
+    def always_down(y):  return BaselineModels._metrics(y, np.zeros_like(y),      "Always-DOWN")
+
+    @staticmethod
+    def logistic_regression_last_step(X_train, y_train, X_test, y_test):
+        Xtr, Xte = X_train[:, -1, :], X_test[:, -1, :]
+        m = LogisticRegression(max_iter=1000, class_weight='balanced', solver='lbfgs')
+        m.fit(Xtr, y_train)
+        y_pred = m.predict(Xte)
+        return y_pred, BaselineModels._metrics(y_test, y_pred, "LogReg-LastStep")
+
+    @staticmethod
+    def mlp_last_step(X_train, y_train, X_test, y_test):
+        Xtr, Xte = X_train[:, -1, :], X_test[:, -1, :]
+        m = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=500,
+                          early_stopping=True, validation_fraction=0.1, random_state=42)
+        m.fit(Xtr, y_train)
+        y_pred = m.predict(Xte)
+        return y_pred, BaselineModels._metrics(y_test, y_pred, "MLP-LastStep")
 
 
 def run_baselines_cv(X: np.ndarray, y: np.ndarray, n_splits: int = None) -> List[Dict]:
@@ -1056,11 +942,10 @@ def print_results_comparison(lstm_metrics: Dict, baseline_results: List[Dict]) -
 
 class QuantumTrainer:
     """
-    Hybrid Quantum Trainer — uses Q# VQC instead of LSTM.
+    Hybrid Quantum Trainer.
 
-    Same expanding-window CV structure as the classical Trainer.
-    Differences:
-      - Input: last timestep of each sequence (22 features), not full window
+    Differences with LSTM:
+      - Input: 18 features
       - Gradients: parameter-shift rule, not PyTorch autograd
       - Adam: implemented manually for numpy parameter arrays
       - Output: saved to models/quantum_params.pkl instead of lstm_model.pt
@@ -1090,16 +975,8 @@ class QuantumTrainer:
         print(f"[QuantumTrainer] Q# available: {self.bridge._qsharp_available}")
 
     def _setup_correlation_entanglement(self, X: np.ndarray) -> None:
-        """Compute feature correlation matrix from training data and wire extra CNOTs."""
-        import pandas as pd
-        # X shape: (n_samples, window_size, n_features) — use last timestep
-        last = X[:, -1, :]  # (n_samples, n_features)
-        corr = np.corrcoef(last.T)  # (n_features, n_features)
+        corr = np.corrcoef(X[:, -1, :].T)
         self.bridge.set_entanglement_from_correlations(corr, threshold=0.7)
-
-    # ------------------------------------------------------------------
-    # Adam state (manual, for numpy params)
-    # ------------------------------------------------------------------
 
     def _adam_init(self) -> dict:
         n = len(self.bridge.params)
@@ -1114,10 +991,6 @@ class QuantumTrainer:
         v_hat = adam["v"] / (1 - adam["b2"] ** adam["t"])
         self.bridge.params -= adam["lr"] * m_hat / (np.sqrt(v_hat) + adam["eps"])
 
-    # ------------------------------------------------------------------
-    # Input prep: take last timestep from sequence
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _extract_last_step(X: np.ndarray) -> np.ndarray:
         """[N, window, features] → [N, features] (last timestep only)."""
@@ -1125,9 +998,6 @@ class QuantumTrainer:
             return X[:, -1, :]
         return X
 
-    # ------------------------------------------------------------------
-    # One epoch of training
-    # ------------------------------------------------------------------
 
     def _train_epoch(self, X_flat: np.ndarray, y: np.ndarray, adam: dict) -> float:
         n = len(y)
@@ -1160,9 +1030,7 @@ class QuantumTrainer:
 
         return total_loss / max(batches, 1)
 
-    # ------------------------------------------------------------------
-    # Per-class probability scaling (decision boundary adjustment)
-    # ------------------------------------------------------------------
+
 
     def _optimize_class_scales(
         self, probs: np.ndarray, labels: np.ndarray
@@ -1185,9 +1053,6 @@ class QuantumTrainer:
               f"UP×{best_scales[2]:.2f}  → val F1={best_f1:.4f}")
         return best_scales
 
-    # ------------------------------------------------------------------
-    # Evaluate on a flat feature set
-    # ------------------------------------------------------------------
 
     def _evaluate_flat(
         self, X_flat: np.ndarray, y: np.ndarray,
@@ -1219,9 +1084,6 @@ class QuantumTrainer:
             "probabilities": probs,
         }
 
-    # ------------------------------------------------------------------
-    # Single fold
-    # ------------------------------------------------------------------
 
     def _train_fold(
         self,
@@ -1229,14 +1091,12 @@ class QuantumTrainer:
         X_val: np.ndarray, y_val: np.ndarray,
         fold_idx: int,
     ) -> dict:
-        # Normalise using training stats
         mean = X_train.mean(axis=0)
         std = X_train.std(axis=0)
         std[std < 1e-8] = 1.0
         X_train_n = (X_train - mean) / std
         X_val_n = (X_val - mean) / std
 
-        # Reset params for each fold
         rng = np.random.default_rng(self.seed + fold_idx)
         self.bridge.params = rng.uniform(-0.1, 0.1, size=self.bridge.total_params)
         adam = self._adam_init()
@@ -1266,14 +1126,10 @@ class QuantumTrainer:
         self.bridge.params = best_params
         return val_metrics, mean, std
 
-    # ------------------------------------------------------------------
-    # Full CV training
-    # ------------------------------------------------------------------
 
     def train(self, X: np.ndarray, y: np.ndarray, timestamps: np.ndarray) -> dict:
         X_flat = self._extract_last_step(X)
 
-        # Wire extra CNOTs from actual training-data correlations
         self._setup_correlation_entanglement(X)
 
         cv = ExpandingWindowCV()
@@ -1301,16 +1157,14 @@ class QuantumTrainer:
 
             val_metrics, mean, std = self._train_fold(X_tr, y_tr, X_v, y_v, fold_idx)
 
-            # Optimise per-class scales on validation, apply to test
             X_v_n = (X_flat[val_idx] - mean) / std
             val_probs = np.array([self.bridge.predict_proba(X_v_n[i]) for i in range(len(y_v))])
             class_scales = self._optimize_class_scales(val_probs, y_v)
 
-            # Evaluate on test with same normalisation and scales
             X_te_n = (X_te - mean) / std
             test_metrics = self._evaluate_flat(X_te_n, y_te, class_scales=class_scales)
 
-            print(f"    Val F1: {val_metrics['macro_f1']:.4f}, "
+            print(f"Val F1: {val_metrics['macro_f1']:.4f}, "
                   f"Test F1: {test_metrics['macro_f1']:.4f}")
 
             all_test_preds.extend(test_metrics["predictions"])
@@ -1328,7 +1182,6 @@ class QuantumTrainer:
                 best_params = self.bridge.params.copy()
                 best_scaler = {"mean": mean, "std": std}
 
-        # Restore best params
         if best_params is not None:
             self.bridge.params = best_params
 
@@ -1356,7 +1209,6 @@ class QuantumTrainer:
         print(f"  Mean F1     : {np.mean(fold_f1s):.4f} +/- {np.std(fold_f1s):.4f}")
         print(f"  Aggregated F1: {aggregated['macro_f1']:.4f}")
 
-        # Per-class metrics (same format as LSTM)
         precision, recall, f1, support = precision_recall_fscore_support(
             all_test_labels, all_test_preds, average=None, zero_division=0
         )
@@ -1376,7 +1228,7 @@ class QuantumTrainer:
             cls = ["DOWN", "FLAT", "UP"][i]
             print(f"  {cls:<6}    {row[0]:>4}  {row[1]:>4}  {row[2]:>4}")
 
-        # Comparison with LSTM baseline
+        # Comparison with LSTM 
         print(f"\n{'='*60}")
         print("MODEL COMPARISON")
         print(f"{'='*60}")
@@ -1387,10 +1239,7 @@ class QuantumTrainer:
         print(f"{'Random baseline':<25} {'~0.3333':>10}")
 
         return {"test_metrics": aggregated, "fold_metrics": fold_metrics}
-
-    # ------------------------------------------------------------------
-    # Save / Load
-    # ------------------------------------------------------------------
+    
 
     def save(self) -> None:
         self.bridge.save(self.QUANTUM_MODEL_PATH)
