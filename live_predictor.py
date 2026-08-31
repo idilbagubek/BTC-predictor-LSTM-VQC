@@ -157,19 +157,28 @@ class LivePredictor:
         
         try:
             checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
-            
+
             model_type = checkpoint.get('model_type', 'LSTMClassifier')
             config = checkpoint.get('config', {})
-            
+
+            # Detect input_size from saved weights so old checkpoints load correctly
+            saved_input_size = (
+                checkpoint['model_state_dict']['lstm.weight_ih_l0'].shape[1]
+            )
+            orig_input_size = model_config.input_size
+            model_config.input_size = saved_input_size
+
             if model_type == 'AttentionLSTMClassifier' or config.get('use_attention', False):
                 self.model = AttentionLSTMClassifier(
                     attention_variant=config.get('attention_variant', model_config.attention_variant)
                 ).to(self.device)
-                print(f"Loaded AttentionLSTMClassifier ({config.get('attention_variant', 'default')})")
+                print(f"Loaded AttentionLSTMClassifier ({config.get('attention_variant', 'default')}, input_size={saved_input_size})")
             else:
                 self.model = LSTMClassifier().to(self.device)
-                print("Loaded LSTMClassifier")
-            
+                print(f"Loaded LSTMClassifier (input_size={saved_input_size})")
+
+            model_config.input_size = orig_input_size  # restore
+
             self.model.load_state_dict(checkpoint['model_state_dict'])
             self.model.eval()
             
@@ -223,10 +232,19 @@ class LivePredictor:
             return None
         
         df_features = self.feature_engineer.compute_features(df)
-        
+
         df_normalized = self.feature_engineer.transform_features(df_features)
-        
-        feature_cols = feature_config.feature_names
+
+        # Use feature list that matches the loaded model's input_size
+        n_model_features = self.model.lstm.input_size if self.model else len(feature_config.feature_names)
+        all_22 = [
+            "log_return_1", "high_low_range", "close_open", "log_volume",
+            "rsi", "macd", "macd_signal", "macd_hist",
+            "atr_norm", "bb_width", "bb_pctb", "ema_gap_fast", "ema_gap_slow",
+            "momentum", "realized_vol", "volume_zscore",
+            "hour_sin", "hour_cos", "dow_sin", "dow_cos", "slope", "vol_regime",
+        ]
+        feature_cols = all_22 if n_model_features == 22 else feature_config.feature_names
         features = df_normalized[feature_cols].iloc[-window_size:].values
         
         if np.any(np.isnan(features)):
