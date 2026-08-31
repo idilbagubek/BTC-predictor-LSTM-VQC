@@ -1,0 +1,1948 @@
+"""
+Training Module
+Enhanced with Focal Loss, Rolling CV with Embargo/Purge, 
+Adaptive Epsilon, Temperature Calibration, and Threshold Optimization
+
+Memory-Efficient: Uses memory-mapped files to handle large datasets
+that don't fit in RAM.
+"""
+
+import os
+import gc
+import math
+import tempfile
+import shutil
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset, Dataset
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import (
+    f1_score, accuracy_score, balanced_accuracy_score,
+    precision_recall_fscore_support, confusion_matrix, log_loss
+)
+from typing import Dict, Tuple, Optional, List
+import pickle
+from datetime import datetime
+from copy import deepcopy
+import warnings
+warnings.filterwarnings('ignore')
+
+from config import (
+    model_config, label_config, feature_config, cv_config, quantum_config,
+    MODEL_PATH, CONFIG_PATH, SCALER_PATH, CALIBRATION_PATH, DATA_DIR
+)
+from model import LSTMClassifier, AttentionLSTMClassifier, FocalLoss, count_parameters, create_model
+from feature_engineer import FeatureEngineer, build_sequences, get_class_distribution
+from data_collector import load_candles_as_dataframe
+
+
+# Memory-mapped dataset directory
+MMAP_DIR = os.path.join(DATA_DIR, "mmap_cache")
+
+
+class MemoryMappedDataset(Dataset):
+    """
+    PyTorch Dataset that uses memory-mapped numpy files.
+    Data lives on disk (SSD) and is loaded on-demand per batch.
+    
+    This allows training on datasets larger than available RAM.
+    """
+    
+    def __init__(self, X_path: str, y_path: str):
+        """
+        Args:
+            X_path: Path to memory-mapped X file (.npy)
+            y_path: Path to memory-mapped y file (.npy)
+        """
+        self.X = np.load(X_path, mmap_mode='r')
+        self.y = np.load(y_path, mmap_mode='r')
+        self.length = len(self.y)
+    
+    def __len__(self):
+        return self.length
+    
+    def __getitem__(self, idx):
+        X_item = torch.tensor(self.X[idx].copy(), dtype=torch.float32)
+        y_item = torch.tensor(self.y[idx], dtype=torch.long)
+        return X_item, y_item
+
+
+class DiskBackedDataManager:
+    """
+    Manages memory-mapped arrays for large datasets.
+    Automatically spills to disk when data is too large for RAM.
+    """
+    
+    def __init__(self, cache_dir: str = None, ram_threshold_gb: float = 4.0):
+        """
+        Args:
+            cache_dir: Directory for memory-mapped files
+            ram_threshold_gb: Use disk if estimated data size exceeds this (GB)
+        """
+        self.cache_dir = cache_dir or MMAP_DIR
+        self.ram_threshold_gb = ram_threshold_gb
+        self.temp_files = []
+        
+        os.makedirs(self.cache_dir, exist_ok=True)
+    
+    def estimate_size_gb(self, shape: tuple, dtype=np.float32) -> float:
+        """Estimate array size in GB."""
+        itemsize = np.dtype(dtype).itemsize
+        total_bytes = np.prod(shape) * itemsize
+        return total_bytes / (1024 ** 3)
+    
+    def should_use_disk(self, X_shape: tuple, y_shape: tuple) -> bool:
+        """Determine if we should use disk-backed storage."""
+        x_size = self.estimate_size_gb(X_shape, np.float32)
+        y_size = self.estimate_size_gb(y_shape, np.int64)
+        total_size = x_size + y_size
+        
+        # Also check available RAM
+        try:
+            import psutil
+            available_gb = psutil.virtual_memory().available / (1024 ** 3)
+            # Use disk if data > 50% of available RAM or > threshold
+            use_disk = total_size > (available_gb * 0.5) or total_size > self.ram_threshold_gb
+        except ImportError:
+            # No psutil, use simple threshold
+            use_disk = total_size > self.ram_threshold_gb
+        
+        return use_disk
+    
+    def save_to_disk(self, X: np.ndarray, y: np.ndarray, prefix: str = "data") -> Tuple[str, str]:
+        """Save arrays as memory-mapped files."""
+        X_path = os.path.join(self.cache_dir, f"{prefix}_X.npy")
+        y_path = os.path.join(self.cache_dir, f"{prefix}_y.npy")
+        
+        np.save(X_path, X)
+        np.save(y_path, y)
+        
+        self.temp_files.extend([X_path, y_path])
+        
+        return X_path, y_path
+    
+    def save_fold_to_disk(
+        self, 
+        X: np.ndarray, 
+        y: np.ndarray, 
+        indices: np.ndarray, 
+        fold_name: str
+    ) -> Tuple[str, str]:
+        """Save a fold's data to disk."""
+        X_fold = X[indices]
+        y_fold = y[indices]
+        
+        X_path = os.path.join(self.cache_dir, f"{fold_name}_X.npy")
+        y_path = os.path.join(self.cache_dir, f"{fold_name}_y.npy")
+        
+        np.save(X_path, X_fold)
+        np.save(y_path, y_fold)
+        
+        self.temp_files.extend([X_path, y_path])
+        
+        # Free memory
+        del X_fold, y_fold
+        gc.collect()
+        
+        return X_path, y_path
+    
+    def create_dataloader(
+        self, 
+        X_path: str, 
+        y_path: str, 
+        batch_size: int, 
+        shuffle: bool = False,
+        num_workers: int = 0
+    ) -> DataLoader:
+        """Create a DataLoader from memory-mapped files."""
+        dataset = MemoryMappedDataset(X_path, y_path)
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=False  # Don't pin with mmap
+        )
+    
+    def cleanup(self):
+        """Remove temporary files."""
+        for path in self.temp_files:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+        self.temp_files = []
+    
+    def clear_cache(self):
+        """Clear entire cache directory."""
+        if os.path.exists(self.cache_dir):
+            shutil.rmtree(self.cache_dir)
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+
+def build_sequences_chunked(
+    df: pd.DataFrame,
+    labels: pd.Series,
+    window_size: int = None,
+    chunk_size: int = 10000,
+    save_path: str = None,
+    verbose: bool = True
+) -> Tuple[str, str, np.ndarray]:
+    """
+    Build sequences in chunks and save directly to disk.
+    Memory-efficient for large datasets.
+    
+    Args:
+        df: DataFrame with features
+        labels: Series with labels
+        window_size: Sequence length
+        chunk_size: Process this many sequences at a time
+        save_path: Directory to save mmap files
+        verbose: Print progress
+    
+    Returns:
+        X_path, y_path, timestamps
+    """
+    window_size = window_size or feature_config.window_size
+    feature_cols = feature_config.feature_names
+    save_path = save_path or MMAP_DIR
+    os.makedirs(save_path, exist_ok=True)
+    
+    features = df[feature_cols].values
+    label_values = labels.values
+    timestamps_all = df.index.values if hasattr(df.index, 'values') else np.arange(len(df))
+    
+    # First pass: count valid sequences
+    valid_indices = []
+    for i in range(window_size - 1, len(df)):
+        if pd.isna(label_values[i]):
+            continue
+        window = features[i - window_size + 1:i + 1]
+        if not np.any(np.isnan(window)):
+            valid_indices.append(i)
+    
+    n_samples = len(valid_indices)
+    n_features = len(feature_cols)
+    
+    if verbose:
+        print(f"  Building {n_samples} sequences in chunks...")
+        print(f"  Saving to disk: {save_path}")
+    
+    # Pre-allocate memory-mapped files
+    X_path = os.path.join(save_path, "sequences_X.npy")
+    y_path = os.path.join(save_path, "sequences_y.npy")
+    
+    X_mmap = np.lib.format.open_memmap(
+        X_path, mode='w+', dtype=np.float32,
+        shape=(n_samples, window_size, n_features)
+    )
+    y_mmap = np.lib.format.open_memmap(
+        y_path, mode='w+', dtype=np.int64,
+        shape=(n_samples,)
+    )
+    
+    # Second pass: build sequences in chunks
+    timestamps = []
+    write_idx = 0
+    
+    for chunk_start in range(0, len(valid_indices), chunk_size):
+        chunk_end = min(chunk_start + chunk_size, len(valid_indices))
+        chunk_indices = valid_indices[chunk_start:chunk_end]
+        
+        for i in chunk_indices:
+            window = features[i - window_size + 1:i + 1]
+            X_mmap[write_idx] = window
+            y_mmap[write_idx] = int(label_values[i])
+            timestamps.append(timestamps_all[i])
+            write_idx += 1
+        
+        # Flush to disk
+        X_mmap.flush()
+        y_mmap.flush()
+        
+        if verbose and (chunk_end % 50000 == 0 or chunk_end == len(valid_indices)):
+            print(f"    Processed {chunk_end}/{len(valid_indices)} sequences")
+    
+    del X_mmap, y_mmap
+    gc.collect()
+    
+    return X_path, y_path, np.array(timestamps)
+
+
+def set_seed(seed: int = 42):
+    """Set random seeds for reproducibility."""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    return seed
+
+
+class ExpandingWindowCV:
+    """
+    Expanding Window Cross-Validation with strict embargo/purge.
+    
+    Each fold expands the training set while keeping validation/test windows
+    rolling forward. Embargo gap prevents label leakage by excluding samples
+    whose labels overlap with validation period.
+    """
+    
+    def __init__(
+        self,
+        n_splits: int = None,
+        embargo_gap: int = None,
+        val_size: int = None,
+        test_size: int = None
+    ):
+        self.n_splits = n_splits or cv_config.n_splits
+        self.embargo_gap = embargo_gap or cv_config.embargo_min_gap
+        self.val_size = val_size or cv_config.validation_min_samples
+        self.test_size = test_size
+    
+    def split(self, X: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """
+        Generate train/val/test indices with embargo gaps.
+        
+        CRITICAL: Excludes training samples where t + horizon >= val_start
+        to prevent label leakage.
+        """
+        n_samples = len(X)
+        
+        if self.test_size is None:
+            self.test_size = max(n_samples // (self.n_splits + 2), self.val_size)
+        
+        splits = []
+        
+        for i in range(self.n_splits):
+            test_end = n_samples - (self.n_splits - 1 - i) * self.test_size
+            test_start = test_end - self.test_size
+            
+            val_end = test_start - self.embargo_gap
+            val_start = val_end - self.val_size
+            
+            train_end = val_start - self.embargo_gap
+            
+            if train_end < self.test_size:
+                continue
+            
+            train_idx = np.arange(0, train_end)
+            val_idx = np.arange(val_start, val_end)
+            test_idx = np.arange(test_start, test_end)
+            
+            min_train = cv_config.validation_min_samples
+            min_val = cv_config.validation_min_samples // 2
+            min_test = cv_config.validation_min_samples // 2
+            
+            if len(train_idx) > min_train and len(val_idx) > min_val and len(test_idx) > min_test:
+                splits.append((train_idx, val_idx, test_idx))
+        
+        return splits
+
+
+class TemperatureScaler:
+    """
+    Temperature scaling for probability calibration.
+    Learns a single temperature T that minimizes NLL on validation set.
+    """
+    
+    def __init__(self, initial_temp: float = 1.0):
+        self.temperature = initial_temp
+    
+    def fit(
+        self, 
+        logits: np.ndarray, 
+        labels: np.ndarray,
+        lr: float = 0.01,
+        max_iter: int = 100
+    ) -> float:
+        """
+        Fit temperature using gradient descent on NLL.
+        """
+        logits_t = torch.tensor(logits, dtype=torch.float32)
+        labels_t = torch.tensor(labels, dtype=torch.long)
+        
+        temp = nn.Parameter(torch.ones(1))
+        optimizer = optim.LBFGS([temp], lr=lr, max_iter=max_iter)
+        
+        def closure():
+            optimizer.zero_grad()
+            scaled_logits = logits_t / temp
+            loss = nn.CrossEntropyLoss()(scaled_logits, labels_t)
+            loss.backward()
+            return loss
+        
+        optimizer.step(closure)
+        
+        self.temperature = max(temp.item(), 0.1)
+        return self.temperature
+    
+    def calibrate(self, logits: np.ndarray) -> np.ndarray:
+        """Apply temperature scaling to get calibrated probabilities."""
+        scaled_logits = logits / self.temperature
+        exp_logits = np.exp(scaled_logits - np.max(scaled_logits, axis=1, keepdims=True))
+        return exp_logits / exp_logits.sum(axis=1, keepdims=True)
+
+
+class ThresholdOptimizer:
+    """
+    Optimize min_confidence and confidence_margin for action decisions.
+    """
+    
+    def __init__(self):
+        self.best_min_confidence = 0.4
+        self.best_confidence_margin = 0.15
+        self.best_score = 0.0
+    
+    def optimize(
+        self,
+        probs: np.ndarray,
+        labels: np.ndarray,
+        metric: str = 'macro_f1'
+    ) -> Tuple[float, float]:
+        """
+        Grid search for optimal thresholds.
+        """
+        best_score = 0.0
+        best_params = (0.4, 0.15)
+        
+        for min_conf in np.arange(0.3, 0.6, 0.05):
+            for margin in np.arange(0.05, 0.25, 0.05):
+                preds = self._apply_thresholds(probs, min_conf, margin)
+                
+                if metric == 'macro_f1':
+                    score = f1_score(labels, preds, average='macro')
+                else:
+                    score = accuracy_score(labels, preds)
+                
+                if score > best_score:
+                    best_score = score
+                    best_params = (min_conf, margin)
+        
+        self.best_min_confidence, self.best_confidence_margin = best_params
+        self.best_score = best_score
+        
+        return best_params
+    
+    def _apply_thresholds(
+        self, 
+        probs: np.ndarray, 
+        min_conf: float, 
+        margin: float
+    ) -> np.ndarray:
+        """Apply thresholds to convert probabilities to predictions."""
+        preds = np.argmax(probs, axis=1)
+        max_probs = np.max(probs, axis=1)
+        sorted_probs = np.sort(probs, axis=1)[:, ::-1]
+        margins = sorted_probs[:, 0] - sorted_probs[:, 1]
+        
+        uncertain = (max_probs < min_conf) | (margins < margin)
+        preds[uncertain] = 1
+        
+        return preds
+
+
+class Trainer:
+    """
+    Enhanced training pipeline with:
+    - Focal Loss for class imbalance
+    - Expanding Window CV with embargo/purge
+    - Adaptive epsilon tuning per fold
+    - Temperature calibration
+    - Threshold optimization
+    - **Memory-efficient disk-backed training for large datasets**
+    """
+    
+    def __init__(
+        self, 
+        device: str = None, 
+        use_rolling_cv: bool = True, 
+        seed: int = 42,
+        use_disk_backend: bool = True,
+        ram_threshold_gb: float = 4.0
+    ):
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = None
+        self.feature_engineer = FeatureEngineer()
+        self.training_history = []
+        self.cv_results = []
+        self.class_weights = None
+        self.use_rolling_cv = use_rolling_cv
+        
+        # Disk-backed storage
+        self.use_disk_backend = use_disk_backend
+        self.data_manager = DiskBackedDataManager(ram_threshold_gb=ram_threshold_gb)
+        self.disk_mode_active = False
+        
+        self.temp_scaler = TemperatureScaler()
+        self.threshold_optimizer = ThresholdOptimizer()
+        
+        self.seed = set_seed(seed)
+        
+        print(f"Using device: {self.device}")
+        print(f"Random seed: {self.seed}")
+        print(f"Cross-validation: {'Expanding Window' if use_rolling_cv else 'Fixed Hold-Out'}")
+        print(f"Model: {'Attention LSTM' if model_config.use_attention else 'Basic LSTM'}")
+        print(f"Loss: {'Focal Loss' if model_config.use_focal_loss else 'Cross Entropy'}")
+        print(f"Disk backend: {'Enabled' if use_disk_backend else 'Disabled'} (threshold: {ram_threshold_gb}GB)")
+    
+    def prepare_data(
+        self, 
+        df: pd.DataFrame,
+        tune_k_per_fold: bool = False
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
+        """
+        Prepare sequences from raw candle data.
+        Automatically uses disk-backed storage if data is too large.
+        """
+        print("Computing features...")
+        df_features = self.feature_engineer.compute_features(df)
+        
+        train_end = int(len(df_features) * 0.6)
+        train_df = df_features.iloc[:train_end]
+        
+        if label_config.use_adaptive_epsilon and not tune_k_per_fold:
+            print("Tuning adaptive epsilon k...")
+            k = self.feature_engineer.tune_k_adaptive(train_df, target_flat_ratio=0.33)
+            print(f"  k: {k:.4f}")
+        else:
+            print("Tuning static epsilon...")
+            epsilon = self.feature_engineer.tune_epsilon(train_df)
+            print(f"  Epsilon: {epsilon:.4f} ({epsilon*100:.2f}%)")
+        
+        print("Computing labels...")
+        labels = self.feature_engineer.compute_labels(
+            df_features, 
+            use_adaptive=label_config.use_adaptive_epsilon
+        )
+        
+        print("Using per-fold normalization...")
+        df_normalized = df_features
+        
+        # Estimate data size
+        n_samples_est = len(df_features) - feature_config.window_size
+        n_features = len(feature_config.feature_names)
+        shape_est = (n_samples_est, feature_config.window_size, n_features)
+        
+        use_disk = self.use_disk_backend and self.data_manager.should_use_disk(shape_est, (n_samples_est,))
+        
+        if use_disk:
+            print("Building sequences (DISK-BACKED MODE - saving to SSD)...")
+            self.disk_mode_active = True
+            X_path, y_path, timestamps = build_sequences_chunked(
+                df_normalized, 
+                labels, 
+                save_path=self.data_manager.cache_dir,
+                verbose=True
+            )
+            # Load as memory-mapped for return (won't load into RAM)
+            X = np.load(X_path, mmap_mode='r')
+            y = np.load(y_path, mmap_mode='r')
+            
+            # Store paths for later use
+            self._X_path = X_path
+            self._y_path = y_path
+        else:
+            print("Building sequences (RAM mode)...")
+            self.disk_mode_active = False
+            X, y, timestamps = build_sequences(
+                df_normalized, 
+                labels, 
+                include_current_candle=True
+            )
+        
+        print(f"  Total samples: {len(y)}")
+        print(f"  Sequence shape: {X.shape}")
+        print(f"  Storage: {'Disk (SSD)' if use_disk else 'RAM'}")
+        
+        # Get class distribution (small sample for mmap)
+        if self.disk_mode_active:
+            y_sample = np.array(y[:min(10000, len(y))])
+            print(f"  Class distribution (sample): {get_class_distribution(y_sample)}")
+        else:
+            print(f"  Class distribution: {get_class_distribution(y)}")
+        
+        return X, y, timestamps, df_features
+    
+    def normalize_fold(
+        self,
+        X_train: np.ndarray,
+        X_val: np.ndarray,
+        X_test: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
+        """Normalize data within a fold using training statistics."""
+        # For memory-mapped arrays, compute stats in chunks
+        if isinstance(X_train, np.memmap):
+            return self._normalize_fold_chunked(X_train, X_val, X_test)
+        
+        train_flat = X_train.reshape(-1, X_train.shape[-1])
+        
+        mean = np.nanmean(train_flat, axis=0)
+        std = np.nanstd(train_flat, axis=0)
+        std[std < 1e-8] = 1.0
+        
+        X_train_norm = (X_train - mean) / std
+        X_val_norm = (X_val - mean) / std
+        X_test_norm = (X_test - mean) / std
+        
+        scaler_params = {'mean': mean, 'std': std}
+        
+        return X_train_norm, X_val_norm, X_test_norm, scaler_params
+    
+    def _normalize_fold_chunked(
+        self,
+        X_train: np.ndarray,
+        X_val: np.ndarray,
+        X_test: np.ndarray,
+        chunk_size: int = 5000
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
+        """Normalize memory-mapped arrays in chunks."""
+        n_features = X_train.shape[-1]
+        
+        # Compute mean and std in chunks
+        running_sum = np.zeros(n_features, dtype=np.float64)
+        running_sq_sum = np.zeros(n_features, dtype=np.float64)
+        n_total = 0
+        
+        for i in range(0, len(X_train), chunk_size):
+            chunk = X_train[i:i+chunk_size].reshape(-1, n_features)
+            chunk = np.array(chunk)  # Load into RAM temporarily
+            running_sum += np.nansum(chunk, axis=0)
+            running_sq_sum += np.nansum(chunk ** 2, axis=0)
+            n_total += chunk.shape[0]
+        
+        mean = running_sum / n_total
+        variance = (running_sq_sum / n_total) - (mean ** 2)
+        std = np.sqrt(np.maximum(variance, 0))
+        std[std < 1e-8] = 1.0
+        
+        mean = mean.astype(np.float32)
+        std = std.astype(np.float32)
+        
+        # Normalize and save to new files
+        def normalize_and_save(X, prefix):
+            save_path = os.path.join(self.data_manager.cache_dir, f"{prefix}_norm.npy")
+            X_norm = np.lib.format.open_memmap(
+                save_path, mode='w+', dtype=np.float32, shape=X.shape
+            )
+            
+            for i in range(0, len(X), chunk_size):
+                chunk = np.array(X[i:i+chunk_size])
+                X_norm[i:i+chunk_size] = (chunk - mean) / std
+                X_norm.flush()
+            
+            self.data_manager.temp_files.append(save_path)
+            del X_norm
+            gc.collect()
+            return np.load(save_path, mmap_mode='r')
+        
+        X_train_norm = normalize_and_save(X_train, "train")
+        X_val_norm = normalize_and_save(X_val, "val")
+        X_test_norm = normalize_and_save(X_test, "test")
+        
+        scaler_params = {'mean': mean, 'std': std}
+        
+        return X_train_norm, X_val_norm, X_test_norm, scaler_params
+    
+    def compute_class_weights(self, y: np.ndarray) -> torch.Tensor:
+        """Compute class weights for imbalanced data."""
+        unique, counts = np.unique(y, return_counts=True)
+        total = len(y)
+        
+        weights = total / (len(unique) * counts)
+        weights = weights / weights.sum() * len(unique)
+        
+        self.class_weights = torch.FloatTensor(weights).to(self.device)
+        
+        return self.class_weights
+    
+    def create_criterion(self, class_weights: torch.Tensor) -> nn.Module:
+        """Create loss function (Focal or CrossEntropy)."""
+        if model_config.use_focal_loss:
+            alpha = class_weights if model_config.focal_alpha is None else \
+                    torch.tensor(model_config.focal_alpha).to(self.device)
+            return FocalLoss(gamma=model_config.focal_gamma, alpha=alpha)
+        else:
+            return nn.CrossEntropyLoss(weight=class_weights)
+    
+    def train_epoch(
+        self,
+        model: nn.Module,
+        dataloader: DataLoader,
+        optimizer: optim.Optimizer,
+        criterion: nn.Module
+    ) -> float:
+        """Train for one epoch."""
+        model.train()
+        total_loss = 0
+        
+        for batch_X, batch_y in dataloader:
+            batch_X = batch_X.to(self.device)
+            batch_y = batch_y.to(self.device)
+            
+            optimizer.zero_grad()
+            logits = model(batch_X)
+            loss = criterion(logits, batch_y)
+            loss.backward()
+            
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), 
+                model_config.gradient_clip_norm
+            )
+            
+            optimizer.step()
+            total_loss += loss.item()
+        
+        return total_loss / len(dataloader)
+    
+    def evaluate(
+        self,
+        model: nn.Module,
+        dataloader: DataLoader,
+        return_logits: bool = False
+    ) -> Dict:
+        """Evaluate model on data."""
+        model.eval()
+        all_preds = []
+        all_labels = []
+        all_probs = []
+        all_logits = []
+        
+        with torch.no_grad():
+            for batch_X, batch_y in dataloader:
+                batch_X = batch_X.to(self.device)
+                
+                logits = model(batch_X)
+                probs = torch.softmax(logits, dim=-1)
+                preds = torch.argmax(probs, dim=-1)
+                
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(batch_y.numpy())
+                all_probs.extend(probs.cpu().numpy())
+                all_logits.extend(logits.cpu().numpy())
+        
+        all_preds = np.array(all_preds)
+        all_labels = np.array(all_labels)
+        all_probs = np.array(all_probs)
+        all_logits = np.array(all_logits)
+        
+        macro_f1 = f1_score(all_labels, all_preds, average='macro')
+        balanced_acc = balanced_accuracy_score(all_labels, all_preds)
+        accuracy = accuracy_score(all_labels, all_preds)
+        
+        precision, recall, f1, support = precision_recall_fscore_support(
+            all_labels, all_preds, average=None, zero_division=0
+        )
+        
+        conf_matrix = confusion_matrix(all_labels, all_preds)
+        
+        result = {
+            'macro_f1': macro_f1,
+            'balanced_accuracy': balanced_acc,
+            'accuracy': accuracy,
+            'per_class': {
+                label_config.idx_to_class[i]: {
+                    'precision': precision[i] if i < len(precision) else 0,
+                    'recall': recall[i] if i < len(recall) else 0,
+                    'f1': f1[i] if i < len(f1) else 0,
+                    'support': support[i] if i < len(support) else 0
+                }
+                for i in range(model_config.num_classes)
+            },
+            'confusion_matrix': conf_matrix,
+            'predictions': all_preds,
+            'labels': all_labels,
+            'probabilities': all_probs
+        }
+        
+        if return_logits:
+            result['logits'] = all_logits
+        
+        return result
+    
+    def train_single_fold(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+        fold_idx: int = 0,
+        verbose: bool = True
+    ) -> Tuple[nn.Module, Dict, List]:
+        """Train model on a single fold. Supports both RAM and disk-backed data."""
+        model = create_model().to(self.device)
+        
+        if verbose and fold_idx == 0:
+            print(f"    Model parameters: {count_parameters(model):,}")
+        
+        # Get class weights - handle mmap arrays
+        if isinstance(y_train, np.memmap):
+            y_train_arr = np.array(y_train)  # Load for class weight computation
+            class_weights = self.compute_class_weights(y_train_arr)
+            del y_train_arr
+            gc.collect()
+        else:
+            class_weights = self.compute_class_weights(y_train)
+        
+        # Create data loaders - use disk-backed if data is mmap
+        if isinstance(X_train, np.memmap):
+            # Save normalized data to disk for this fold
+            train_X_path = os.path.join(self.data_manager.cache_dir, f"fold{fold_idx}_train_X.npy")
+            train_y_path = os.path.join(self.data_manager.cache_dir, f"fold{fold_idx}_train_y.npy")
+            val_X_path = os.path.join(self.data_manager.cache_dir, f"fold{fold_idx}_val_X.npy")
+            val_y_path = os.path.join(self.data_manager.cache_dir, f"fold{fold_idx}_val_y.npy")
+            
+            np.save(train_X_path, X_train)
+            np.save(train_y_path, y_train)
+            np.save(val_X_path, X_val)
+            np.save(val_y_path, y_val)
+            
+            self.data_manager.temp_files.extend([train_X_path, train_y_path, val_X_path, val_y_path])
+            
+            train_loader = self.data_manager.create_dataloader(
+                train_X_path, train_y_path,
+                batch_size=model_config.batch_size,
+                shuffle=True
+            )
+            val_loader = self.data_manager.create_dataloader(
+                val_X_path, val_y_path,
+                batch_size=model_config.batch_size,
+                shuffle=False
+            )
+        else:
+            train_dataset = TensorDataset(
+                torch.tensor(X_train, dtype=torch.float32),
+                torch.tensor(y_train, dtype=torch.long)
+            )
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=model_config.batch_size,
+                shuffle=True,
+                num_workers=0,
+                pin_memory=True if self.device == 'cuda' else False
+            )
+            
+            val_dataset = TensorDataset(
+                torch.tensor(X_val, dtype=torch.float32),
+                torch.tensor(y_val, dtype=torch.long)
+            )
+            val_loader = DataLoader(val_dataset, batch_size=model_config.batch_size)
+        
+        criterion = self.create_criterion(class_weights)
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=model_config.learning_rate,
+            weight_decay=model_config.weight_decay
+        )
+        
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.5, patience=5
+        )
+        
+        best_val_f1 = 0
+        patience_counter = 0
+        best_model_state = None
+        fold_history = []
+        
+        for epoch in range(model_config.max_epochs):
+            train_loss = self.train_epoch(model, train_loader, optimizer, criterion)
+            val_metrics = self.evaluate(model, val_loader)
+            val_f1 = val_metrics['macro_f1']
+            
+            scheduler.step(val_f1)
+            
+            fold_history.append({
+                'epoch': epoch + 1,
+                'train_loss': train_loss,
+                'val_macro_f1': val_f1,
+                'val_balanced_acc': val_metrics['balanced_accuracy']
+            })
+            
+            if verbose and (epoch + 1) % 10 == 0:
+                print(f"    Epoch {epoch+1}: loss={train_loss:.4f}, val_F1={val_f1:.4f}")
+            
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
+                best_model_state = deepcopy(model.state_dict())
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= model_config.early_stopping_patience:
+                    if verbose:
+                        print(f"    Early stopping at epoch {epoch+1}")
+                    break
+        
+        if best_model_state:
+            model.load_state_dict(best_model_state)
+        
+        final_val_metrics = self.evaluate(model, val_loader, return_logits=True)
+        
+        # Clean up fold-specific files
+        gc.collect()
+        
+        return model, final_val_metrics, fold_history
+    
+    def train_with_rolling_cv(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        timestamps: np.ndarray,
+        verbose: bool = True
+    ) -> Dict:
+        """
+        Train with Expanding Window CV with embargo/purge.
+        Supports disk-backed training for large datasets.
+        """
+        cv = ExpandingWindowCV()
+        splits = cv.split(X)
+        
+        if len(splits) < 2:
+            print("Warning: Not enough data for rolling CV, falling back to fixed split")
+            return self.train_with_fixed_split(X, y, timestamps, verbose)
+        
+        print(f"\nExpanding Window CV with {len(splits)} folds:")
+        print(f"  Embargo gap: {cv.embargo_gap} samples (horizon leakage prevention)")
+        print(f"  Storage mode: {'Disk-backed (SSD)' if self.disk_mode_active else 'RAM'}")
+        
+        all_test_preds = []
+        all_test_labels = []
+        all_test_probs = []
+        all_val_logits = []
+        all_val_labels = []
+        fold_metrics = []
+        best_model = None
+        best_fold_f1 = 0
+        best_scaler_params = None
+        
+        for fold_idx, (train_idx, val_idx, test_idx) in enumerate(splits):
+            print(f"\n  Fold {fold_idx + 1}/{len(splits)}:")
+            print(f"    Train: {len(train_idx)} samples (0 to {train_idx[-1]})")
+            print(f"    Val: {len(val_idx)} samples ({val_idx[0]} to {val_idx[-1]})")
+            print(f"    Test: {len(test_idx)} samples ({test_idx[0]} to {test_idx[-1]})")
+            
+            # Extract fold data - handle mmap arrays carefully
+            if self.disk_mode_active:
+                # For disk-backed, extract indices and normalize in chunks
+                X_train = X[train_idx]
+                y_train = y[train_idx]
+                X_val = X[val_idx]
+                y_val = y[val_idx]
+                X_test = X[test_idx]
+                y_test = y[test_idx]
+                
+                # Convert to regular arrays for normalization (in chunks internally)
+                X_train_norm, X_val_norm, X_test_norm, scaler_params = self._normalize_fold_disk(
+                    X, y, train_idx, val_idx, test_idx, fold_idx
+                )
+                y_train = np.array(y[train_idx])
+                y_val = np.array(y[val_idx])
+                y_test = np.array(y[test_idx])
+            else:
+                X_train, y_train = X[train_idx], y[train_idx]
+                X_val, y_val = X[val_idx], y[val_idx]
+                X_test, y_test = X[test_idx], y[test_idx]
+                
+                X_train_norm, X_val_norm, X_test_norm, scaler_params = self.normalize_fold(
+                    X_train, X_val, X_test
+                )
+            
+            model, val_metrics, fold_history = self.train_single_fold(
+                X_train_norm, y_train,
+                X_val_norm, y_val,
+                fold_idx=fold_idx,
+                verbose=verbose
+            )
+            
+            # Evaluate on test set
+            if self.disk_mode_active:
+                test_X_path = os.path.join(self.data_manager.cache_dir, f"fold{fold_idx}_test_X.npy")
+                test_y_path = os.path.join(self.data_manager.cache_dir, f"fold{fold_idx}_test_y.npy")
+                np.save(test_X_path, X_test_norm)
+                np.save(test_y_path, y_test)
+                self.data_manager.temp_files.extend([test_X_path, test_y_path])
+                
+                test_loader = self.data_manager.create_dataloader(
+                    test_X_path, test_y_path,
+                    batch_size=model_config.batch_size,
+                    shuffle=False
+                )
+            else:
+                test_dataset = TensorDataset(
+                    torch.tensor(X_test_norm, dtype=torch.float32),
+                    torch.tensor(y_test, dtype=torch.long)
+                )
+                test_loader = DataLoader(test_dataset, batch_size=model_config.batch_size)
+            
+            test_metrics = self.evaluate(model, test_loader)
+            
+            print(f"    Val F1: {val_metrics['macro_f1']:.4f}, Test F1: {test_metrics['macro_f1']:.4f}")
+            
+            all_test_preds.extend(test_metrics['predictions'])
+            all_test_labels.extend(test_metrics['labels'])
+            all_test_probs.extend(test_metrics['probabilities'])
+            
+            if 'logits' in val_metrics:
+                all_val_logits.extend(val_metrics['logits'])
+                all_val_labels.extend(val_metrics['labels'])
+            
+            fold_metrics.append({
+                'fold': fold_idx + 1,
+                'train_size': len(train_idx),
+                'val_metrics': val_metrics,
+                'test_metrics': test_metrics,
+                'history': fold_history
+            })
+            
+            if test_metrics['macro_f1'] > best_fold_f1:
+                best_fold_f1 = test_metrics['macro_f1']
+                best_model = deepcopy(model)
+                best_scaler_params = scaler_params
+                self.training_history = fold_history
+            
+            # Free memory after each fold
+            del X_train_norm, X_val_norm, X_test_norm
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        all_test_preds = np.array(all_test_preds)
+        all_test_labels = np.array(all_test_labels)
+        all_test_probs = np.array(all_test_probs)
+        
+        if len(all_val_logits) > 0:
+            print("\n  Calibrating temperature...")
+            all_val_logits = np.array(all_val_logits)
+            all_val_labels = np.array(all_val_labels)
+            
+            temp = self.temp_scaler.fit(all_val_logits, all_val_labels)
+            print(f"    Optimal temperature: {temp:.4f}")
+            
+            cal_probs = self.temp_scaler.calibrate(all_val_logits)
+            
+            print("  Optimizing thresholds...")
+            best_thresholds = self.threshold_optimizer.optimize(cal_probs, all_val_labels)
+            print(f"    Best thresholds: min_conf={best_thresholds[0]:.2f}, margin={best_thresholds[1]:.2f}")
+            print(f"    Threshold-optimized F1: {self.threshold_optimizer.best_score:.4f}")
+        
+        aggregated_metrics = self._compute_aggregated_metrics(all_test_labels, all_test_preds, all_test_probs)
+        
+        self.model = best_model
+        if best_scaler_params:
+            self.feature_engineer.scaler_params = {
+                'mean': {name: best_scaler_params['mean'][i] 
+                        for i, name in enumerate(feature_config.feature_names)},
+                'std': {name: best_scaler_params['std'][i] 
+                       for i, name in enumerate(feature_config.feature_names)}
+            }
+        
+        self.cv_results = fold_metrics
+        
+        self._print_cv_summary(fold_metrics, aggregated_metrics)
+        
+        # Cleanup disk cache
+        if self.disk_mode_active:
+            print("\n  Cleaning up disk cache...")
+            self.data_manager.cleanup()
+        
+        return {
+            'test_metrics': aggregated_metrics,
+            'fold_metrics': fold_metrics,
+            'cv_summary': self._get_cv_summary(fold_metrics),
+            'calibration': {
+                'temperature': self.temp_scaler.temperature,
+                'min_confidence': self.threshold_optimizer.best_min_confidence,
+                'confidence_margin': self.threshold_optimizer.best_confidence_margin
+            }
+        }
+    
+    def _normalize_fold_disk(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        train_idx: np.ndarray,
+        val_idx: np.ndarray,
+        test_idx: np.ndarray,
+        fold_idx: int,
+        chunk_size: int = 2000
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
+        """Normalize fold data using disk-backed chunked processing."""
+        n_features = X.shape[-1]
+        window_size = X.shape[1]
+        
+        # Compute mean and std from training data in chunks
+        running_sum = np.zeros(n_features, dtype=np.float64)
+        running_sq_sum = np.zeros(n_features, dtype=np.float64)
+        n_total = 0
+        
+        for i in range(0, len(train_idx), chunk_size):
+            idx_chunk = train_idx[i:i+chunk_size]
+            chunk = np.array(X[idx_chunk]).reshape(-1, n_features)
+            running_sum += np.nansum(chunk, axis=0)
+            running_sq_sum += np.nansum(chunk ** 2, axis=0)
+            n_total += chunk.shape[0]
+            del chunk
+        
+        mean = (running_sum / n_total).astype(np.float32)
+        variance = (running_sq_sum / n_total) - (mean ** 2)
+        std = np.sqrt(np.maximum(variance, 0)).astype(np.float32)
+        std[std < 1e-8] = 1.0
+        
+        def normalize_indices(indices, name):
+            n = len(indices)
+            save_path = os.path.join(self.data_manager.cache_dir, f"fold{fold_idx}_{name}_norm.npy")
+            
+            X_norm = np.lib.format.open_memmap(
+                save_path, mode='w+', dtype=np.float32, shape=(n, window_size, n_features)
+            )
+            
+            for i in range(0, n, chunk_size):
+                idx_chunk = indices[i:i+chunk_size]
+                chunk = np.array(X[idx_chunk])
+                X_norm[i:i+len(idx_chunk)] = (chunk - mean) / std
+                X_norm.flush()
+                del chunk
+            
+            self.data_manager.temp_files.append(save_path)
+            del X_norm
+            gc.collect()
+            return np.load(save_path, mmap_mode='r')
+        
+        X_train_norm = normalize_indices(train_idx, "train")
+        X_val_norm = normalize_indices(val_idx, "val")
+        X_test_norm = normalize_indices(test_idx, "test")
+        
+        scaler_params = {'mean': mean, 'std': std}
+        
+        return X_train_norm, X_val_norm, X_test_norm, scaler_params
+    
+    def _compute_aggregated_metrics(
+        self, 
+        labels: np.ndarray, 
+        preds: np.ndarray, 
+        probs: np.ndarray
+    ) -> Dict:
+        """Compute aggregated metrics across all folds."""
+        precision, recall, f1, support = precision_recall_fscore_support(
+            labels, preds, average=None, zero_division=0
+        )
+        
+        return {
+            'macro_f1': f1_score(labels, preds, average='macro'),
+            'balanced_accuracy': balanced_accuracy_score(labels, preds),
+            'accuracy': accuracy_score(labels, preds),
+            'confusion_matrix': confusion_matrix(labels, preds),
+            'predictions': preds,
+            'labels': labels,
+            'probabilities': probs,
+            'per_class': {
+                label_config.idx_to_class[i]: {
+                    'precision': precision[i] if i < len(precision) else 0,
+                    'recall': recall[i] if i < len(recall) else 0,
+                    'f1': f1[i] if i < len(f1) else 0,
+                    'support': support[i] if i < len(support) else 0
+                }
+                for i in range(model_config.num_classes)
+            }
+        }
+    
+    def _get_cv_summary(self, fold_metrics: List[Dict]) -> Dict:
+        """Get summary statistics from CV folds."""
+        fold_f1s = [f['test_metrics']['macro_f1'] for f in fold_metrics]
+        return {
+            'mean_f1': np.mean(fold_f1s),
+            'std_f1': np.std(fold_f1s),
+            'min_f1': np.min(fold_f1s),
+            'max_f1': np.max(fold_f1s)
+        }
+    
+    def _print_cv_summary(self, fold_metrics: List[Dict], aggregated_metrics: Dict):
+        """Print CV summary."""
+        print("\n" + "="*60)
+        print("EXPANDING WINDOW CV SUMMARY")
+        print("="*60)
+        fold_f1s = [f['test_metrics']['macro_f1'] for f in fold_metrics]
+        print(f"  Per-fold Test F1: {[f'{f:.4f}' for f in fold_f1s]}")
+        print(f"  Mean F1: {np.mean(fold_f1s):.4f} +/- {np.std(fold_f1s):.4f}")
+        print(f"  Aggregated F1: {aggregated_metrics['macro_f1']:.4f}")
+    
+    def train_with_fixed_split(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        timestamps: np.ndarray,
+        verbose: bool = True
+    ) -> Dict:
+        """Train with traditional fixed hold-out split."""
+        n_samples = len(X)
+        
+        train_end = int(n_samples * model_config.train_ratio)
+        val_end = int(n_samples * (model_config.train_ratio + model_config.val_ratio))
+        
+        X_train, y_train = X[:train_end], y[:train_end]
+        X_val, y_val = X[train_end:val_end], y[train_end:val_end]
+        X_test, y_test = X[val_end:], y[val_end:]
+        
+        X_train_norm, X_val_norm, X_test_norm, scaler_params = self.normalize_fold(
+            X_train, X_val, X_test
+        )
+        
+        self.feature_engineer.scaler_params = {
+            'mean': {name: scaler_params['mean'][i] 
+                    for i, name in enumerate(feature_config.feature_names)},
+            'std': {name: scaler_params['std'][i] 
+                   for i, name in enumerate(feature_config.feature_names)}
+        }
+        
+        print(f"\nFixed hold-out split:")
+        print(f"  Train: {len(X_train)} samples")
+        print(f"  Val: {len(X_val)} samples")
+        print(f"  Test: {len(X_test)} samples")
+        
+        self.model, val_metrics, self.training_history = self.train_single_fold(
+            X_train_norm, y_train,
+            X_val_norm, y_val,
+            verbose=verbose
+        )
+        
+        print(f"\nBest validation macro-F1: {val_metrics['macro_f1']:.4f}")
+        
+        test_dataset = TensorDataset(
+            torch.tensor(X_test_norm, dtype=torch.float32),
+            torch.tensor(y_test, dtype=torch.long)
+        )
+        test_loader = DataLoader(test_dataset, batch_size=model_config.batch_size)
+        test_metrics = self.evaluate(self.model, test_loader, return_logits=True)
+        
+        if 'logits' in val_metrics:
+            temp = self.temp_scaler.fit(val_metrics['logits'], val_metrics['labels'])
+            print(f"Temperature: {temp:.4f}")
+            
+            cal_probs = self.temp_scaler.calibrate(val_metrics['logits'])
+            self.threshold_optimizer.optimize(cal_probs, val_metrics['labels'])
+        
+        return {
+            'val_metrics': val_metrics,
+            'test_metrics': test_metrics,
+            'training_history': self.training_history,
+            'calibration': {
+                'temperature': self.temp_scaler.temperature,
+                'min_confidence': self.threshold_optimizer.best_min_confidence,
+                'confidence_margin': self.threshold_optimizer.best_confidence_margin
+            }
+        }
+    
+    def train(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        timestamps: np.ndarray,
+        verbose: bool = True
+    ) -> Dict:
+        """Main training method."""
+        if self.use_rolling_cv:
+            return self.train_with_rolling_cv(X, y, timestamps, verbose=verbose)
+        else:
+            return self.train_with_fixed_split(X, y, timestamps, verbose=verbose)
+    
+    def save_model(self, path: str = None) -> None:
+        """Save trained model, config, and calibration."""
+        path = path or MODEL_PATH
+        
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'model_type': self.model.__class__.__name__,
+            'class_weights': self.class_weights,
+            'training_history': self.training_history,
+            'cv_results': self.cv_results,
+            'seed': self.seed,
+            'config': {
+                'use_attention': model_config.use_attention,
+                'attention_variant': model_config.attention_variant,
+                'hidden_size': model_config.hidden_size,
+                'num_layers': model_config.num_layers
+            }
+        }, path)
+        
+        self.feature_engineer.save_scaler()
+        self.save_calibration()
+        
+        print(f"Model saved to {path}")
+    
+    def save_calibration(self, path: str = None) -> None:
+        """Save calibration parameters."""
+        path = path or CALIBRATION_PATH
+        
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'temperature': self.temp_scaler.temperature,
+                'min_confidence': self.threshold_optimizer.best_min_confidence,
+                'confidence_margin': self.threshold_optimizer.best_confidence_margin,
+                'k_value': self.feature_engineer.k_value,
+                'epsilon': self.feature_engineer.epsilon
+            }, f)
+        
+        print(f"Calibration saved to {path}")
+    
+    def load_model(self, path: str = None) -> None:
+        """Load trained model."""
+        path = path or MODEL_PATH
+        
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        
+        model_type = checkpoint.get('model_type', 'LSTMClassifier')
+        config = checkpoint.get('config', {})
+        
+        if model_type == 'AttentionLSTMClassifier' or config.get('use_attention', False):
+            self.model = AttentionLSTMClassifier(
+                attention_variant=config.get('attention_variant', model_config.attention_variant)
+            ).to(self.device)
+        else:
+            self.model = LSTMClassifier().to(self.device)
+        
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.class_weights = checkpoint.get('class_weights')
+        self.training_history = checkpoint.get('training_history', [])
+        self.cv_results = checkpoint.get('cv_results', [])
+        
+        self.feature_engineer.load_scaler()
+        self.load_calibration()
+        
+        print(f"Model loaded from {path}")
+    
+    def load_calibration(self, path: str = None) -> None:
+        """Load calibration parameters."""
+        path = path or CALIBRATION_PATH
+        
+        if os.path.exists(path):
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
+                self.temp_scaler.temperature = data.get('temperature', 1.0)
+                self.threshold_optimizer.best_min_confidence = data.get('min_confidence', 0.4)
+                self.threshold_optimizer.best_confidence_margin = data.get('confidence_margin', 0.15)
+                
+                if 'k_value' in data:
+                    self.feature_engineer.k_value = data['k_value']
+                if 'epsilon' in data:
+                    self.feature_engineer.epsilon = data['epsilon']
+            
+            print(f"Calibration loaded from {path}")
+
+
+class BaselineModels:
+    """Baseline models for comparison."""
+    
+    @staticmethod
+    def always_flat(y_true: np.ndarray) -> Dict:
+        y_pred = np.ones_like(y_true)
+        return BaselineModels._compute_metrics(y_true, y_pred, "Always-FLAT")
+    
+    @staticmethod
+    def always_up(y_true: np.ndarray) -> Dict:
+        y_pred = np.full_like(y_true, 2)
+        return BaselineModels._compute_metrics(y_true, y_pred, "Always-UP")
+    
+    @staticmethod
+    def always_down(y_true: np.ndarray) -> Dict:
+        y_pred = np.zeros_like(y_true)
+        return BaselineModels._compute_metrics(y_true, y_pred, "Always-DOWN")
+    
+    @staticmethod
+    def logistic_regression_last_step(
+        X_train: np.ndarray, 
+        y_train: np.ndarray,
+        X_test: np.ndarray,
+        y_test: np.ndarray
+    ) -> Tuple[np.ndarray, Dict]:
+        X_train_last = X_train[:, -1, :]
+        X_test_last = X_test[:, -1, :]
+        
+        model = LogisticRegression(
+            max_iter=1000,
+            class_weight='balanced',
+            solver='lbfgs'
+        )
+        model.fit(X_train_last, y_train)
+        y_pred = model.predict(X_test_last)
+        
+        return y_pred, BaselineModels._compute_metrics(y_test, y_pred, "LogReg-LastStep")
+    
+    @staticmethod
+    def mlp_last_step(
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_test: np.ndarray,
+        y_test: np.ndarray
+    ) -> Tuple[np.ndarray, Dict]:
+        X_train_last = X_train[:, -1, :]
+        X_test_last = X_test[:, -1, :]
+        
+        model = MLPClassifier(
+            hidden_layer_sizes=(64, 32),
+            max_iter=500,
+            early_stopping=True,
+            validation_fraction=0.1,
+            random_state=42
+        )
+        model.fit(X_train_last, y_train)
+        y_pred = model.predict(X_test_last)
+        
+        return y_pred, BaselineModels._compute_metrics(y_test, y_pred, "MLP-LastStep")
+    
+    @staticmethod
+    def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, name: str) -> Dict:
+        return {
+            'name': name,
+            'macro_f1': f1_score(y_true, y_pred, average='macro'),
+            'balanced_accuracy': balanced_accuracy_score(y_true, y_pred),
+            'accuracy': accuracy_score(y_true, y_pred),
+            'confusion_matrix': confusion_matrix(y_true, y_pred)
+        }
+
+
+def run_baselines_cv(X: np.ndarray, y: np.ndarray, n_splits: int = None) -> List[Dict]:
+    """
+    Run baseline models using the same CV folds as LSTM for fair comparison.
+    """
+    n_splits = n_splits or cv_config.n_splits
+    cv = ExpandingWindowCV(n_splits=n_splits)
+    splits = cv.split(X)
+    
+    if len(splits) < 2:
+        return run_baselines_simple(X, y)
+    
+    print(f"\nRunning baselines with {len(splits)}-fold CV (same as LSTM)...")
+    
+    logreg_all_preds = []
+    logreg_all_labels = []
+    mlp_all_preds = []
+    mlp_all_labels = []
+    naive_all_labels = []
+    
+    for fold_idx, (train_idx, val_idx, test_idx) in enumerate(splits):
+        X_train, y_train = X[train_idx], y[train_idx]
+        X_test, y_test = X[test_idx], y[test_idx]
+        
+        train_flat = X_train.reshape(-1, X_train.shape[-1])
+        mean = np.nanmean(train_flat, axis=0)
+        std = np.nanstd(train_flat, axis=0)
+        std[std < 1e-8] = 1.0
+        
+        X_train_norm = (X_train - mean) / std
+        X_test_norm = (X_test - mean) / std
+        
+        logreg_preds, _ = BaselineModels.logistic_regression_last_step(
+            X_train_norm, y_train, X_test_norm, y_test
+        )
+        mlp_preds, _ = BaselineModels.mlp_last_step(
+            X_train_norm, y_train, X_test_norm, y_test
+        )
+        
+        logreg_all_preds.extend(logreg_preds)
+        logreg_all_labels.extend(y_test)
+        mlp_all_preds.extend(mlp_preds)
+        mlp_all_labels.extend(y_test)
+        naive_all_labels.extend(y_test)
+    
+    results = []
+    
+    naive_labels = np.array(naive_all_labels)
+    results.append(BaselineModels.always_flat(naive_labels))
+    results.append(BaselineModels.always_up(naive_labels))
+    results.append(BaselineModels.always_down(naive_labels))
+    
+    results.append(BaselineModels._compute_metrics(
+        np.array(logreg_all_labels), 
+        np.array(logreg_all_preds), 
+        "LogReg-LastStep"
+    ))
+    results.append(BaselineModels._compute_metrics(
+        np.array(mlp_all_labels), 
+        np.array(mlp_all_preds), 
+        "MLP-LastStep"
+    ))
+    
+    return results
+
+
+def run_baselines_simple(X: np.ndarray, y: np.ndarray, train_ratio: float = 0.7) -> List[Dict]:
+    """Simple baseline evaluation with fixed split (fallback)."""
+    n = len(X)
+    train_end = int(n * train_ratio)
+    
+    X_train, y_train = X[:train_end], y[:train_end]
+    X_test, y_test = X[train_end:], y[train_end:]
+    
+    print("\nRunning baseline comparisons (simple split)...")
+    results = []
+    results.append(BaselineModels.always_flat(y_test))
+    results.append(BaselineModels.always_up(y_test))
+    results.append(BaselineModels.always_down(y_test))
+    
+    _, logreg_metrics = BaselineModels.logistic_regression_last_step(X_train, y_train, X_test, y_test)
+    results.append(logreg_metrics)
+    
+    _, mlp_metrics = BaselineModels.mlp_last_step(X_train, y_train, X_test, y_test)
+    results.append(mlp_metrics)
+    
+    return results
+
+
+def run_baselines(X: np.ndarray, y: np.ndarray, train_ratio: float = 0.7) -> List[Dict]:
+    """Run all baseline models - uses CV if enough data."""
+    if len(X) > 5000:
+        return run_baselines_cv(X, y)
+    else:
+        return run_baselines_simple(X, y, train_ratio)
+
+
+def print_results_comparison(lstm_metrics: Dict, baseline_results: List[Dict]) -> None:
+    """Print formatted comparison of LSTM vs baselines."""
+    print("\n" + "="*60)
+    print("MODEL COMPARISON (Test Set)")
+    print("="*60)
+    
+    print(f"\n{'Model':<25} {'Macro-F1':>10} {'Bal.Acc':>10} {'Acc':>10}")
+    print("-"*60)
+    
+    print(f"{'LSTM (ours)':<25} {lstm_metrics['macro_f1']:>10.4f} "
+          f"{lstm_metrics['balanced_accuracy']:>10.4f} {lstm_metrics['accuracy']:>10.4f}")
+    
+    print("-"*60)
+    
+    for baseline in baseline_results:
+        print(f"{baseline['name']:<25} {baseline['macro_f1']:>10.4f} "
+              f"{baseline['balanced_accuracy']:>10.4f} {baseline['accuracy']:>10.4f}")
+    
+    print("\n" + "="*60)
+    print("LSTM Per-Class Metrics")
+    print("="*60)
+    
+    print(f"\n{'Class':<10} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}")
+    print("-"*50)
+    
+    for cls, metrics in lstm_metrics['per_class'].items():
+        print(f"{cls:<10} {metrics['precision']:>10.4f} {metrics['recall']:>10.4f} "
+              f"{metrics['f1']:>10.4f} {metrics['support']:>10}")
+    
+    print("\nConfusion Matrix:")
+    print("Predicted ->  DOWN  FLAT    UP")
+    for i, row in enumerate(lstm_metrics['confusion_matrix']):
+        label = label_config.idx_to_class[i]
+        print(f"  {label:<6}    {row[0]:>4}  {row[1]:>4}  {row[2]:>4}")
+
+
+class QuantumTrainer:
+    """
+    Hybrid Quantum Trainer — uses Q# VQC instead of LSTM.
+
+    Same expanding-window CV structure as the classical Trainer.
+    Differences:
+      - Input: last timestep of each sequence (22 features), not full window
+      - Gradients: parameter-shift rule, not PyTorch autograd
+      - Adam: implemented manually for numpy parameter arrays
+      - Output: saved to models/quantum_params.pkl instead of lstm_model.pt
+    """
+
+    QUANTUM_MODEL_PATH = os.path.join(os.path.dirname(MODEL_PATH), "quantum_params.pkl")
+
+    def __init__(self, seed: int = 42):
+        from quantum_bridge import QuantumVQCBridge
+
+        set_seed(seed)
+        self.seed = seed
+        self.feature_engineer = FeatureEngineer()
+        self.bridge = QuantumVQCBridge(
+            n_features=len(feature_config.feature_names),
+            n_qubits=quantum_config.n_data_qubits,
+            n_shots=quantum_config.n_shots,
+        )
+        self.temp_scaler = TemperatureScaler()
+        self.threshold_optimizer = ThresholdOptimizer()
+        self.cv_results = []
+
+        print(f"[QuantumTrainer] n_data_qubits={quantum_config.n_data_qubits}, "
+              f"n_rounds={self.bridge.n_rounds}, "
+              f"n_shots={quantum_config.n_shots}")
+        print(f"[QuantumTrainer] Total circuit params: {self.bridge.total_params}")
+        print(f"[QuantumTrainer] Q# available: {self.bridge._qsharp_available}")
+
+    def _setup_correlation_entanglement(self, X: np.ndarray) -> None:
+        """Compute feature correlation matrix from training data and wire extra CNOTs."""
+        import pandas as pd
+        # X shape: (n_samples, window_size, n_features) — use last timestep
+        last = X[:, -1, :]  # (n_samples, n_features)
+        corr = np.corrcoef(last.T)  # (n_features, n_features)
+        self.bridge.set_entanglement_from_correlations(corr, threshold=0.7)
+
+    # ------------------------------------------------------------------
+    # Adam state (manual, for numpy params)
+    # ------------------------------------------------------------------
+
+    def _adam_init(self) -> dict:
+        n = len(self.bridge.params)
+        return {"m": np.zeros(n), "v": np.zeros(n), "t": 0,
+                "lr": quantum_config.learning_rate, "b1": 0.9, "b2": 0.999, "eps": 1e-8}
+
+    def _adam_step(self, adam: dict, grad: np.ndarray) -> None:
+        adam["t"] += 1
+        adam["m"] = adam["b1"] * adam["m"] + (1 - adam["b1"]) * grad
+        adam["v"] = adam["b2"] * adam["v"] + (1 - adam["b2"]) * grad ** 2
+        m_hat = adam["m"] / (1 - adam["b1"] ** adam["t"])
+        v_hat = adam["v"] / (1 - adam["b2"] ** adam["t"])
+        self.bridge.params -= adam["lr"] * m_hat / (np.sqrt(v_hat) + adam["eps"])
+
+    # ------------------------------------------------------------------
+    # Input prep: take last timestep from sequence
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_last_step(X: np.ndarray) -> np.ndarray:
+        """[N, window, features] → [N, features] (last timestep only)."""
+        if X.ndim == 3:
+            return X[:, -1, :]
+        return X
+
+    # ------------------------------------------------------------------
+    # One epoch of training
+    # ------------------------------------------------------------------
+
+    def _train_epoch(self, X_flat: np.ndarray, y: np.ndarray, adam: dict) -> float:
+        n = len(y)
+        indices = np.random.permutation(n)
+        total_loss = 0.0
+        batches = 0
+
+        n_batches = math.ceil(n / quantum_config.batch_size)
+        for batch_num, start in enumerate(range(0, n, quantum_config.batch_size)):
+            batch_idx = indices[start:start + quantum_config.batch_size]
+            batch_grad = np.zeros_like(self.bridge.params)
+            batch_loss = 0.0
+
+            for i in batch_idx:
+                features = X_flat[i]
+                target_idx = int(y[i])
+                target_one_hot = np.eye(3)[target_idx]
+
+                probs = self.bridge.predict_proba(features)
+                batch_loss += -np.log(probs[target_idx] + 1e-9)
+                batch_grad += self.bridge.spsa_gradient(features, target_one_hot,
+                                                         n_estimates=quantum_config.spsa_estimates)
+
+            batch_grad /= len(batch_idx)
+            self._adam_step(adam, batch_grad)
+
+            total_loss += batch_loss / len(batch_idx)
+            batches += 1
+            print(f"\r    Batch {batch_num+1}/{n_batches} — loss={batch_loss/len(batch_idx):.4f}", end="", flush=True)
+
+        return total_loss / max(batches, 1)
+
+    # ------------------------------------------------------------------
+    # Per-class probability scaling (decision boundary adjustment)
+    # ------------------------------------------------------------------
+
+    def _optimize_class_scales(
+        self, probs: np.ndarray, labels: np.ndarray
+    ) -> np.ndarray:
+        """
+        Grid-search per-class scale factors that maximise macro-F1 on validation.
+        Scales are multiplied into softmax probs before argmax — this shifts the
+        decision boundary toward under-predicted minority classes without retraining.
+        """
+        best_f1, best_scales = 0.0, np.ones(3)
+        for s_down in np.arange(1.0, 3.1, 0.25):
+            for s_flat in np.arange(0.3, 1.1, 0.1):
+                for s_up in np.arange(1.0, 3.1, 0.25):
+                    scales = np.array([s_down, s_flat, s_up])
+                    preds = np.argmax(probs * scales, axis=1)
+                    f1 = f1_score(labels, preds, average="macro", zero_division=0)
+                    if f1 > best_f1:
+                        best_f1, best_scales = f1, scales
+        print(f"    [ClassScales] DOWN×{best_scales[0]:.2f}, FLAT×{best_scales[1]:.2f}, "
+              f"UP×{best_scales[2]:.2f}  → val F1={best_f1:.4f}")
+        return best_scales
+
+    # ------------------------------------------------------------------
+    # Evaluate on a flat feature set
+    # ------------------------------------------------------------------
+
+    def _evaluate_flat(
+        self, X_flat: np.ndarray, y: np.ndarray,
+        class_scales: np.ndarray | None = None,
+    ) -> dict:
+        preds, probs_list = [], []
+        for i in range(len(y)):
+            p = self.bridge.predict_proba(X_flat[i])
+            probs_list.append(p)
+
+        probs = np.array(probs_list)
+        labels = np.array(y)
+
+        if class_scales is not None:
+            preds = np.argmax(probs * class_scales, axis=1)
+        else:
+            preds = np.argmax(probs, axis=1)
+
+        macro_f1 = f1_score(labels, preds, average="macro", zero_division=0)
+        balanced_acc = balanced_accuracy_score(labels, preds)
+        accuracy = accuracy_score(labels, preds)
+
+        return {
+            "macro_f1": macro_f1,
+            "balanced_accuracy": balanced_acc,
+            "accuracy": accuracy,
+            "predictions": preds,
+            "labels": labels,
+            "probabilities": probs,
+        }
+
+    # ------------------------------------------------------------------
+    # Single fold
+    # ------------------------------------------------------------------
+
+    def _train_fold(
+        self,
+        X_train: np.ndarray, y_train: np.ndarray,
+        X_val: np.ndarray, y_val: np.ndarray,
+        fold_idx: int,
+    ) -> dict:
+        # Normalise using training stats
+        mean = X_train.mean(axis=0)
+        std = X_train.std(axis=0)
+        std[std < 1e-8] = 1.0
+        X_train_n = (X_train - mean) / std
+        X_val_n = (X_val - mean) / std
+
+        # Reset params for each fold
+        rng = np.random.default_rng(self.seed + fold_idx)
+        self.bridge.params = rng.uniform(-0.1, 0.1, size=self.bridge.total_params)
+        adam = self._adam_init()
+
+        best_val_f1 = 0.0
+        best_params = self.bridge.params.copy()
+        patience = 0
+
+        for epoch in range(quantum_config.max_epochs):
+            loss = self._train_epoch(X_train_n, y_train, adam)
+            val_metrics = self._evaluate_flat(X_val_n, y_val)
+            val_f1 = val_metrics["macro_f1"]
+
+            if (epoch + 1) % 5 == 0:
+                print(f"    Epoch {epoch+1}: loss={loss:.4f}, val_F1={val_f1:.4f}")
+
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
+                best_params = self.bridge.params.copy()
+                patience = 0
+            else:
+                patience += 1
+                if patience >= quantum_config.early_stopping_patience:
+                    print(f"    Early stopping at epoch {epoch+1}")
+                    break
+
+        self.bridge.params = best_params
+        return val_metrics, mean, std
+
+    # ------------------------------------------------------------------
+    # Full CV training
+    # ------------------------------------------------------------------
+
+    def train(self, X: np.ndarray, y: np.ndarray, timestamps: np.ndarray) -> dict:
+        X_flat = self._extract_last_step(X)
+
+        # Wire extra CNOTs from actual training-data correlations
+        self._setup_correlation_entanglement(X)
+
+        cv = ExpandingWindowCV()
+        splits = cv.split(X_flat)
+
+        if len(splits) < 2:
+            raise RuntimeError("Not enough data for expanding-window CV.")
+
+        print(f"\n[QuantumTrainer] Expanding Window CV — {len(splits)} folds")
+        print("  (Each sample runs 2 × n_params circuit evaluations for gradient)")
+
+        all_test_preds, all_test_labels, all_test_probs = [], [], []
+        fold_metrics = []
+        best_val_f1 = 0.0
+        best_params = None
+        best_scaler = None
+
+        for fold_idx, (train_idx, val_idx, test_idx) in enumerate(splits):
+            print(f"\n  Fold {fold_idx+1}/{len(splits)}: "
+                  f"train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
+
+            X_tr, y_tr = X_flat[train_idx], y[train_idx]
+            X_v,  y_v  = X_flat[val_idx],   y[val_idx]
+            X_te, y_te = X_flat[test_idx],  y[test_idx]
+
+            val_metrics, mean, std = self._train_fold(X_tr, y_tr, X_v, y_v, fold_idx)
+
+            # Optimise per-class scales on validation, apply to test
+            X_v_n = (X_flat[val_idx] - mean) / std
+            val_probs = np.array([self.bridge.predict_proba(X_v_n[i]) for i in range(len(y_v))])
+            class_scales = self._optimize_class_scales(val_probs, y_v)
+
+            # Evaluate on test with same normalisation and scales
+            X_te_n = (X_te - mean) / std
+            test_metrics = self._evaluate_flat(X_te_n, y_te, class_scales=class_scales)
+
+            print(f"    Val F1: {val_metrics['macro_f1']:.4f}, "
+                  f"Test F1: {test_metrics['macro_f1']:.4f}")
+
+            all_test_preds.extend(test_metrics["predictions"])
+            all_test_labels.extend(test_metrics["labels"])
+            all_test_probs.extend(test_metrics["probabilities"])
+
+            fold_metrics.append({
+                "fold": fold_idx + 1,
+                "val_metrics": val_metrics,
+                "test_metrics": test_metrics,
+            })
+
+            if val_metrics["macro_f1"] > best_val_f1:
+                best_val_f1 = val_metrics["macro_f1"]
+                best_params = self.bridge.params.copy()
+                best_scaler = {"mean": mean, "std": std}
+
+        # Restore best params
+        if best_params is not None:
+            self.bridge.params = best_params
+
+        all_test_labels = np.array(all_test_labels)
+        all_test_preds  = np.array(all_test_preds)
+        all_test_probs  = np.array(all_test_probs)
+
+        aggregated = {
+            "macro_f1": f1_score(all_test_labels, all_test_preds, average="macro"),
+            "balanced_accuracy": balanced_accuracy_score(all_test_labels, all_test_preds),
+            "accuracy": accuracy_score(all_test_labels, all_test_preds),
+            "predictions": all_test_preds,
+            "labels": all_test_labels,
+            "probabilities": all_test_probs,
+        }
+
+        self.cv_results = fold_metrics
+        self._best_scaler = best_scaler
+
+        fold_f1s = [f["test_metrics"]["macro_f1"] for f in fold_metrics]
+        print(f"\n{'='*60}")
+        print("QUANTUM VQC CV SUMMARY")
+        print(f"{'='*60}")
+        print(f"  Per-fold F1 : {[f'{f:.4f}' for f in fold_f1s]}")
+        print(f"  Mean F1     : {np.mean(fold_f1s):.4f} +/- {np.std(fold_f1s):.4f}")
+        print(f"  Aggregated F1: {aggregated['macro_f1']:.4f}")
+
+        # Per-class metrics (same format as LSTM)
+        precision, recall, f1, support = precision_recall_fscore_support(
+            all_test_labels, all_test_preds, average=None, zero_division=0
+        )
+        print(f"\n{'='*60}")
+        print("QUANTUM VQC Per-Class Metrics")
+        print(f"{'='*60}")
+        print(f"\n{'Class':<10} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}")
+        print("-"*50)
+        for i, cls in enumerate(["DOWN", "FLAT", "UP"]):
+            print(f"{cls:<10} {precision[i]:>10.4f} {recall[i]:>10.4f} "
+                  f"{f1[i]:>10.4f} {int(support[i]):>10}")
+
+        cm = confusion_matrix(all_test_labels, all_test_preds)
+        print(f"\nConfusion Matrix:")
+        print("Predicted ->  DOWN  FLAT    UP")
+        for i, row in enumerate(cm):
+            cls = ["DOWN", "FLAT", "UP"][i]
+            print(f"  {cls:<6}    {row[0]:>4}  {row[1]:>4}  {row[2]:>4}")
+
+        # Comparison with LSTM baseline
+        print(f"\n{'='*60}")
+        print("MODEL COMPARISON")
+        print(f"{'='*60}")
+        print(f"{'Model':<25} {'Macro-F1':>10}")
+        print("-"*35)
+        print(f"{'Quantum VQC':<25} {aggregated['macro_f1']:>10.4f}")
+        print(f"{'Classical LSTM (ref)':<25} {'~0.3675':>10}")
+        print(f"{'Random baseline':<25} {'~0.3333':>10}")
+
+        return {"test_metrics": aggregated, "fold_metrics": fold_metrics}
+
+    # ------------------------------------------------------------------
+    # Save / Load
+    # ------------------------------------------------------------------
+
+    def save(self) -> None:
+        self.bridge.save(self.QUANTUM_MODEL_PATH)
+        scaler_path = SCALER_PATH.replace("scaler.pkl", "quantum_scaler.pkl")
+        with open(scaler_path, "wb") as f:
+            pickle.dump(self._best_scaler, f)
+        print(f"[QuantumTrainer] Scaler saved to {scaler_path}")
+
+    def load(self) -> None:
+        from quantum_bridge import QuantumVQCBridge
+        self.bridge = QuantumVQCBridge.load(self.QUANTUM_MODEL_PATH)
+        scaler_path = SCALER_PATH.replace("scaler.pkl", "quantum_scaler.pkl")
+        with open(scaler_path, "rb") as f:
+            self._best_scaler = pickle.load(f)
+
+
+def main():
+    """Main training pipeline."""
+    print("="*60)
+    print("BTC Price Direction Classifier - Enhanced Training Pipeline")
+    print("="*60)
+    
+    print("\nLoading candle data...")
+    df = load_candles_as_dataframe()
+    
+    if len(df) < 5000:
+        print(f"Warning: Only {len(df)} candles available.")
+        print("Minimum recommended: 10,000+ candles for meaningful training.")
+        
+        if len(df) < 2000:
+            print("Not enough data to train. Exiting.")
+            return None, None, None
+    
+    print(f"Loaded {len(df)} candles")
+    print(f"Date range: {df.index[0]} to {df.index[-1]}")
+    
+    trainer = Trainer(use_rolling_cv=True)
+    
+    X, y, timestamps, df_features = trainer.prepare_data(df)
+    
+    baseline_results = run_baselines(X, y)
+    
+    results = trainer.train(X, y, timestamps, verbose=True)
+    
+    print_results_comparison(results['test_metrics'], baseline_results)
+    
+    lstm_f1 = results['test_metrics']['macro_f1']
+    best_baseline_f1 = max(b['macro_f1'] for b in baseline_results)
+    
+    if lstm_f1 > best_baseline_f1:
+        print(f"\n[OK] LSTM outperforms best baseline by {(lstm_f1-best_baseline_f1)*100:.1f}% F1")
+    else:
+        print(f"\n[!] LSTM does not outperform baselines.")
+        print("  Consider: adjusting epsilon, window size, or gathering more data.")
+    
+    if 'calibration' in results:
+        print("\nCalibration Results:")
+        print(f"  Temperature: {results['calibration']['temperature']:.4f}")
+        print(f"  Min Confidence: {results['calibration']['min_confidence']:.2f}")
+        print(f"  Confidence Margin: {results['calibration']['confidence_margin']:.2f}")
+    
+    print("\nSaving model...")
+    trainer.save_model()
+    
+    return trainer, results, baseline_results
+
+
+if __name__ == "__main__":
+    result = main()
+    if result[0] is not None:
+        trainer, results, baselines = result
