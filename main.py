@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 BTC Price Direction Predictor - Main Entry Point
 =================================================

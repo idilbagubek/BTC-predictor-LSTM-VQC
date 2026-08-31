@@ -17,7 +17,6 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timezone
 
-# ── project imports ──────────────────────────────────────────────────────────
 from config import (
     feature_config, label_config, model_config,
     MODEL_PATH, SCALER_PATH, CALIBRATION_PATH,
@@ -38,10 +37,7 @@ LSTM_FEATURES_22 = [
     "hour_sin", "hour_cos", "dow_sin", "dow_cos", "slope", "vol_regime",
 ]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def load_data(feat_cols=None):
     """
