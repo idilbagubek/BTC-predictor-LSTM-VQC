@@ -131,13 +131,17 @@ class LivePredictor:
     - Exact feature pipeline matching training
     """
     
-    def __init__(self, device: str = None):
+    def __init__(self, device: str = None, use_quantum: bool = False):
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = None
+        self.use_quantum = use_quantum
+        self.quantum_bridge = None
+        self.quantum_mean = None
+        self.quantum_std  = None
         self.feature_engineer = FeatureEngineer()
         self.last_prediction_time = None
         self.history = PredictionHistory()
-        
+
         self.temperature = 1.0
         self.min_confidence = inference_config.min_confidence
         self.confidence_margin = inference_config.confidence_margin
@@ -219,6 +223,30 @@ class LivePredictor:
         else:
             print(f"Warning: Calibration file not found at {path}, using defaults")
     
+    def load_quantum_model(self) -> bool:
+        """Load trained Quantum VQC parameters and scaler."""
+        from quantum_bridge import QuantumVQCBridge
+        q_model  = os.path.join(os.path.dirname(MODEL_PATH), "quantum_params.pkl")
+        q_scaler = os.path.join(os.path.dirname(MODEL_PATH), "quantum_scaler.pkl")
+
+        if not os.path.exists(q_model):
+            print(f"Error: quantum_params.pkl not found. Run: python main.py train --quantum")
+            return False
+
+        self.quantum_bridge = QuantumVQCBridge.load(q_model)
+
+        if os.path.exists(q_scaler):
+            with open(q_scaler, "rb") as f:
+                sc = pickle.load(f)
+            self.quantum_mean = sc["mean"]
+            self.quantum_std  = sc["std"]
+
+        print(f"Quantum model loaded  "
+              f"(params={self.quantum_bridge.total_params}, "
+              f"qubits={self.quantum_bridge.n_total}, "
+              f"rounds={self.quantum_bridge.n_rounds})")
+        return True
+
     def prepare_features(self, df: pd.DataFrame) -> Optional[np.ndarray]:
         """
         Prepare feature sequence from candle data.
@@ -233,6 +261,12 @@ class LivePredictor:
         
         df_features = self.feature_engineer.compute_features(df)
 
+        if self.use_quantum:
+            # Quantum only needs the last timestep — raw features, scaler applied in predict()
+            feat_cols = feature_config.feature_names
+            last_row = df_features[feat_cols].dropna().iloc[-1].values.astype(np.float32)
+            return last_row.reshape(1, -1)
+
         df_normalized = self.feature_engineer.transform_features(df_features)
 
         # Use feature list that matches the loaded model's input_size
@@ -246,30 +280,33 @@ class LivePredictor:
         ]
         feature_cols = all_22 if n_model_features == 22 else feature_config.feature_names
         features = df_normalized[feature_cols].iloc[-window_size:].values
-        
+
         if np.any(np.isnan(features)):
             nan_counts = np.isnan(features).sum(axis=0)
             nan_features = [feature_cols[i] for i, c in enumerate(nan_counts) if c > 0]
             print(f"Warning: NaN in features: {nan_features}")
-            
             features = np.nan_to_num(features, nan=0.0)
-        
+
         features = features.reshape(1, window_size, -1).astype(np.float32)
-        
         return features
     
     def predict(self, features: np.ndarray) -> Dict:
         """
-        Run inference with temperature-calibrated probabilities.
+        Run inference — quantum VQC or classical LSTM depending on use_quantum.
         """
-        with torch.no_grad():
-            x = torch.tensor(features, dtype=torch.float32).to(self.device)
-            
-            logits = self.model(x)[0].cpu().numpy()
-            
-            scaled_logits = logits / self.temperature
-            exp_logits = np.exp(scaled_logits - np.max(scaled_logits))
-            probs = exp_logits / exp_logits.sum()
+        if self.use_quantum:
+            # features is a flat 1-D array (last timestep only)
+            flat = features.flatten()
+            if self.quantum_mean is not None:
+                flat = (flat - self.quantum_mean) / self.quantum_std
+            probs = self.quantum_bridge.predict_proba(flat)
+        else:
+            with torch.no_grad():
+                x = torch.tensor(features, dtype=torch.float32).to(self.device)
+                logits = self.model(x)[0].cpu().numpy()
+                scaled_logits = logits / self.temperature
+                exp_logits = np.exp(scaled_logits - np.max(scaled_logits))
+                probs = exp_logits / exp_logits.sum()
         
         pred_idx = np.argmax(probs)
         pred_class = label_config.idx_to_class[pred_idx]
@@ -292,7 +329,7 @@ class LivePredictor:
             'margin': float(margin),
             'entropy': float(entropy),
             'action': action,
-            'raw_logits': logits.tolist(),
+            'raw_logits': logits.tolist() if not self.use_quantum else probs.tolist(),
             'temperature': self.temperature
         }
     
@@ -606,31 +643,36 @@ def run_single(predictor: LivePredictor):
 def main():
     """Main entry point for live inference"""
     import argparse
-    
+
     parser = argparse.ArgumentParser(description='BTC Price Direction Predictor')
-    parser.add_argument('--single', action='store_true', 
+    parser.add_argument('--quantum', action='store_true',
+                        help='Use Quantum VQC instead of classical LSTM')
+    parser.add_argument('--single', action='store_true',
                         help='Run single prediction and exit')
     parser.add_argument('--interval', type=int, default=15,
                         help='Update interval in MINUTES (default: 15)')
     args = parser.parse_args()
-    
+
     init_database()
-    
+
     count = get_candle_count()
     if count < feature_config.window_size:
         print(f"Insufficient data: {count} candles available, "
               f"need at least {feature_config.window_size}")
-        print("Run: python data_collector.py to fetch historical data first")
+        print("Run: python main.py collect --days 30")
         sys.exit(1)
-    
-    predictor = LivePredictor()
-    
-    if not predictor.load_model():
-        print("\nPlease train the model first:")
-        print("  1. python data_collector.py  # Fetch data")
-        print("  2. python trainer.py         # Train model")
-        sys.exit(1)
-    
+
+    predictor = LivePredictor(use_quantum=args.quantum)
+
+    if args.quantum:
+        if not predictor.load_quantum_model():
+            sys.exit(1)
+    else:
+        if not predictor.load_model():
+            print("\nPlease train the model first:")
+            print("  python main.py train")
+            sys.exit(1)
+
     if args.single:
         run_single(predictor)
     else:

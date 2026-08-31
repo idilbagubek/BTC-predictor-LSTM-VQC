@@ -9,8 +9,6 @@ Usage:
     python main.py collect    # Fetch historical data
     python main.py train      # Train the LSTM model
     python main.py predict    # Run live predictions
-    python main.py all        # Run full pipeline
-    python main.py status     # Check system status
 """
 
 import sys
@@ -106,121 +104,18 @@ def cmd_train(args):
 
 
 def cmd_predict(args):
-    """Run live predictions"""
+    """Run live predictions (LSTM or Quantum VQC)"""
     from live_predictor import main as predict_main
-    
+
     sys.argv = ['live_predictor.py']
+    if getattr(args, 'quantum', False):
+        sys.argv.append('--quantum')
     if args.single:
         sys.argv.append('--single')
     if args.interval:
         sys.argv.extend(['--interval', str(args.interval)])
-    
+
     predict_main()
-
-
-def cmd_status(args):
-    """Check system status"""
-    from config import MODEL_PATH, SCALER_PATH, DB_PATH, CALIBRATION_PATH, model_config
-    from data_collector import get_candle_count, get_oldest_candle_time, get_latest_candle_time, init_database
-    import pickle
-    
-    print("="*60)
-    print("SYSTEM STATUS")
-    print("="*60)
-    
-    print("\n[Database]")
-    db_exists = os.path.exists(DB_PATH)
-    count = get_candle_count() if db_exists else 0
-    
-    if db_exists and count > 0:
-        oldest = get_oldest_candle_time()
-        latest = get_latest_candle_time()
-        
-        print(f"  Path: {DB_PATH}")
-        print(f"  Candles: {count:,}")
-        
-        if oldest and latest:
-            oldest_dt = datetime.fromtimestamp(oldest/1000, tz=timezone.utc)
-            latest_dt = datetime.fromtimestamp(latest/1000, tz=timezone.utc)
-            print(f"  Range: {oldest_dt.strftime('%Y-%m-%d %H:%M')} to {latest_dt.strftime('%Y-%m-%d %H:%M')}")
-            
-            age_minutes = (datetime.now(timezone.utc).timestamp() - latest/1000) / 60
-            if age_minutes < 5:
-                print(f"  Status: [OK] Fresh (updated {age_minutes:.0f}m ago)")
-            else:
-                print(f"  Status: [!] Stale (last update {age_minutes:.0f}m ago)")
-    else:
-        print(f"  Status: [X] Not found or empty")
-        print(f"  Run: python main.py collect")
-    
-    print("\n[Model]")
-    if os.path.exists(MODEL_PATH):
-        import torch
-        checkpoint = torch.load(MODEL_PATH, map_location='cpu', weights_only=False)
-        
-        print(f"  Path: {MODEL_PATH}")
-        print(f"  Status: [OK] Trained")
-        
-        model_type = checkpoint.get('model_type', 'LSTMClassifier')
-        config = checkpoint.get('config', {})
-        print(f"  Type: {model_type}")
-        
-        if config:
-            print(f"  Attention: {config.get('attention_variant', 'N/A')}")
-            print(f"  Hidden: {config.get('hidden_size', 'N/A')}")
-            print(f"  Layers: {config.get('num_layers', 'N/A')}")
-        
-        if 'training_history' in checkpoint and checkpoint['training_history']:
-            last_epoch = checkpoint['training_history'][-1]
-            print(f"  Last epoch: {last_epoch.get('epoch', '?')}")
-            print(f"  Val F1: {last_epoch.get('val_macro_f1', 0):.4f}")
-        
-        if 'cv_results' in checkpoint and checkpoint['cv_results']:
-            cv_f1s = [f['test_metrics']['macro_f1'] for f in checkpoint['cv_results']]
-            print(f"  CV Folds: {len(cv_f1s)}")
-            print(f"  CV Mean F1: {sum(cv_f1s)/len(cv_f1s):.4f}")
-    else:
-        print(f"  Status: [X] Not found")
-        print(f"  Run: python main.py train")
-    
-    print("\n[Scaler]")
-    if os.path.exists(SCALER_PATH):
-        print(f"  Path: {SCALER_PATH}")
-        print(f"  Status: [OK] Saved")
-    else:
-        print(f"  Status: [X] Not found")
-    
-    print("\n[Calibration]")
-    if os.path.exists(CALIBRATION_PATH):
-        with open(CALIBRATION_PATH, 'rb') as f:
-            cal_data = pickle.load(f)
-        print(f"  Path: {CALIBRATION_PATH}")
-        print(f"  Status: [OK] Saved")
-        print(f"  Temperature: {cal_data.get('temperature', 'N/A'):.4f}")
-        print(f"  Min Confidence: {cal_data.get('min_confidence', 'N/A'):.2f}")
-        print(f"  Confidence Margin: {cal_data.get('confidence_margin', 'N/A'):.2f}")
-        if 'k_value' in cal_data:
-            print(f"  Adaptive k: {cal_data.get('k_value', 'N/A'):.4f}")
-    else:
-        print(f"  Status: [X] Not found (will use defaults)")
-    
-    print("\n[Readiness]")
-    ready = all([
-        db_exists and count >= 1000,
-        os.path.exists(MODEL_PATH),
-        os.path.exists(SCALER_PATH)
-    ])
-    
-    if ready:
-        print("  [OK] System ready for live predictions")
-        print("  Run: python main.py predict")
-    else:
-        print("  [X] System not ready")
-        print("  Required steps:")
-        if not db_exists or count < 1000:
-            print("    1. python main.py collect --days 30")
-        if not os.path.exists(MODEL_PATH):
-            print("    2. python main.py train")
 
 
 def cmd_all(args):
@@ -233,9 +128,6 @@ def cmd_all(args):
     print()
     
     cmd_train(args)
-    print()
-    
-    cmd_status(args)
     print()
     
     print("Pipeline complete! Run 'python main.py predict' to start live predictions.")
@@ -298,7 +190,6 @@ Examples:
   python main.py train                Train the LSTM model with rolling CV
   python main.py predict              Start live predictions
   python main.py predict --single     Run single prediction
-  python main.py status               Check system status
   python main.py config               Show current configuration
   python main.py all --days 30        Run full pipeline
         """
@@ -315,6 +206,8 @@ Examples:
                               help='Use hybrid quantum VQC instead of classical LSTM')
     
     predict_parser = subparsers.add_parser('predict', help='Run live predictions')
+    predict_parser.add_argument('--quantum', action='store_true',
+                               help='Use Quantum VQC instead of classical LSTM')
     predict_parser.add_argument('--single', action='store_true',
                                help='Single prediction and exit')
     predict_parser.add_argument('--interval', type=int, default=15,
@@ -338,7 +231,6 @@ Examples:
         'collect': cmd_collect,
         'train': cmd_train,
         'predict': cmd_predict,
-        'status': cmd_status,
         'config': cmd_config,
         'all': cmd_all
     }
